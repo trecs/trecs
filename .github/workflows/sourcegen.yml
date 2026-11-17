@@ -16,18 +16,22 @@ jobs:
       - name: Setup .NET
         uses: actions/setup-dotnet@v5
         with:
-          dotnet-version: |
-            8.0.x
-            9.0.x
+          # 8.0.x: runtime for the net8.0 tests. global.json pins the SDK that builds the
+          # shipped DLL, so the runner image's preinstalled SDKs can't change its IL.
+          dotnet-version: 8.0.x
+          global-json-file: SourceGen/Trecs.SourceGen/global.json
 
       - name: Restore dependencies
-        run: dotnet restore SourceGen/Trecs.SourceGen/Trecs.SourceGen.sln
+        working-directory: SourceGen/Trecs.SourceGen
+        run: dotnet restore Trecs.SourceGen.sln
 
       - name: Build
-        run: dotnet build SourceGen/Trecs.SourceGen/Trecs.SourceGen.sln -c Release --no-restore
+        working-directory: SourceGen/Trecs.SourceGen
+        run: dotnet build Trecs.SourceGen.sln -c Release --no-restore
 
       - name: Test
-        run: dotnet test SourceGen/Trecs.SourceGen/Trecs.SourceGen.sln -c Release --no-build --logger "console;verbosity=normal"
+        working-directory: SourceGen/Trecs.SourceGen
+        run: dotnet test Trecs.SourceGen.sln -c Release --no-build --logger "console;verbosity=normal"
 
       # The shipped Trecs.SourceGen.dll is hand-committed into the Unity project via
       # build_and_install.sh. Verify the committed copy is semantically identical to a
