@@ -86,16 +86,20 @@ namespace Trecs.Internal
         bool _hasDisposed;
         bool _hasRunFirstTick;
 
+        readonly NativeHeap _nativeHeap;
+
         internal SystemRunner(
             TrecsLog log,
             EntitySubmitter entitySubmitter,
             WorldSettings settings,
             InterpolatedPreviousSaverManager interpolatedPreviousSaverManager,
             RuntimeJobScheduler jobScheduler,
-            EntityInputQueue entityInputQueue
+            EntityInputQueue entityInputQueue,
+            NativeHeap nativeHeap
         )
         {
             settings ??= new WorldSettings();
+            _nativeHeap = nativeHeap;
 
             _log = log;
             _maxSecondsPerFixedUpdate = settings.MaxSecondsForFixedUpdatePerFrame;
@@ -784,6 +788,8 @@ namespace Trecs.Internal
             {
                 _entitySubmitter.FlushAllSetJobWrites();
             }
+
+            _nativeHeap.AdoptDetached();
         }
 
         /// <summary>

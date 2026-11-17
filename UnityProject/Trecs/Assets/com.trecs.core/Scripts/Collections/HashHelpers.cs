@@ -106,6 +106,33 @@ namespace Trecs.Internal
             return min;
         }
 
+        /// <summary>Largest prime ≤ <paramref name="max"/>; <paramref name="max"/> itself below 4.</summary>
+        public static int GetPrimeAtMost(int max)
+        {
+            if (max < 4)
+            {
+                return max;
+            }
+            var n = (max & 1) == 0 ? max - 1 : max;
+            while (!IsOddPrime(n))
+            {
+                n -= 2;
+            }
+            return n;
+        }
+
+        static bool IsOddPrime(int n)
+        {
+            for (int d = 3; d * d <= n; d += 2)
+            {
+                if (n % d == 0)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
         // Returns size of hashtable to grow to.
         public static int Expand(int oldSize)
         {

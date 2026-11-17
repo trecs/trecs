@@ -1,7 +1,5 @@
 using System;
-using System.ComponentModel;
 using System.Runtime.CompilerServices;
-using Trecs.Collections;
 using Trecs.Internal;
 using Unity.Burst;
 using Unity.Collections;
@@ -9,26 +7,24 @@ using Unity.Collections.LowLevel.Unsafe;
 
 namespace Trecs
 {
+    /// <summary>
+    /// Burst-safe writable view over a <see cref="TrecsDictionary{TKey, TValue}"/>. Adding
+    /// grows on any thread (see <see cref="NativeTrecsListWrite{T}"/>); the <c>NoResize</c>
+    /// variants skip the capacity branch. Reaches the block through the allocation's
+    /// side-table entry on every access, so copies of the view stay valid across a grow.
+    /// </summary>
     [NativeContainer]
-    public unsafe struct NativeTrecsDictionaryWrite<TKey, TValue>
+    public readonly unsafe struct NativeTrecsDictionaryWrite<TKey, TValue>
         where TKey : unmanaged, IEquatable<TKey>
         where TValue : unmanaged
     {
         [NativeDisableUnsafePtrRestriction]
-        readonly TrecsDictionaryHeader* _header;
+        readonly NativeHeapEntry* _slot;
 
         [NativeDisableUnsafePtrRestriction]
-        readonly IterableDictionaryNode<TKey>* _nodes;
+        readonly NativeHeapDetachLog* _detachLog;
 
-        [NativeDisableUnsafePtrRestriction]
-        readonly TValue* _values;
-
-        [NativeDisableUnsafePtrRestriction]
-        readonly int* _buckets;
-
-        [NativeDisableUnsafePtrRestriction]
-        readonly NativeHeapEntry* _headerSlot;
-        readonly byte _capturedGeneration;
+        readonly PtrHandle _handle;
 
 #if ENABLE_UNITY_COLLECTIONS_CHECKS
         readonly AtomicSafetyHandle m_Safety;
@@ -36,77 +32,37 @@ namespace Trecs
         static readonly SharedStatic<int> s_staticSafetyId = SharedStatic<int>.GetOrCreate<
             NativeTrecsDictionaryWrite<TKey, TValue>
         >();
-#endif
 
-#if ENABLE_UNITY_COLLECTIONS_CHECKS
-        [EditorBrowsable(EditorBrowsableState.Never)]
-        public NativeTrecsDictionaryWrite(
-            TrecsDictionaryHeader* header,
-            IterableDictionaryNode<TKey>* nodes,
-            TValue* values,
-            int* buckets,
-            NativeHeapEntry* headerSlot,
-            byte capturedGeneration,
+        internal NativeTrecsDictionaryWrite(
+            NativeHeapEntry* slot,
+            PtrHandle handle,
+            NativeHeapDetachLog* detachLog,
             AtomicSafetyHandle safety
         )
         {
-            _header = header;
-            _nodes = nodes;
-            _values = values;
-            _buckets = buckets;
-            _headerSlot = headerSlot;
-            _capturedGeneration = capturedGeneration;
+            _slot = slot;
+            _handle = handle;
+            _detachLog = detachLog;
             m_Safety = safety;
             CollectionHelper.SetStaticSafetyId<NativeTrecsDictionaryWrite<TKey, TValue>>(
                 ref m_Safety,
                 ref s_staticSafetyId.Data
             );
-            CheckSlotAlive();
         }
 #else
-        [EditorBrowsable(EditorBrowsableState.Never)]
-        public NativeTrecsDictionaryWrite(
-            TrecsDictionaryHeader* header,
-            IterableDictionaryNode<TKey>* nodes,
-            TValue* values,
-            int* buckets,
-            NativeHeapEntry* headerSlot,
-            byte capturedGeneration
+        internal NativeTrecsDictionaryWrite(
+            NativeHeapEntry* slot,
+            PtrHandle handle,
+            NativeHeapDetachLog* detachLog
         )
         {
-            _header = header;
-            _nodes = nodes;
-            _values = values;
-            _buckets = buckets;
-            _headerSlot = headerSlot;
-            _capturedGeneration = capturedGeneration;
-            CheckSlotAlive();
+            _slot = slot;
+            _handle = handle;
+            _detachLog = detachLog;
         }
 #endif
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        void CheckSlotAlive()
-        {
-            TrecsAssert.That(
-                _headerSlot->Generation == _capturedGeneration && _headerSlot->InUse == 1,
-                "NativeTrecsDictionaryWrite is stale: the underlying allocation has been "
-                    + "freed (captured slot gen {0}, current {1}, InUse {2}).",
-                _capturedGeneration,
-                _headerSlot->Generation,
-                _headerSlot->InUse
-            );
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        void BumpVersion()
-        {
-            unchecked
-            {
-                ++_header->Version;
-            }
-        }
-
-        public int Count
+        TrecsDictionaryHeader* ReadHeader
         {
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
             get
@@ -114,28 +70,45 @@ namespace Trecs
 #if ENABLE_UNITY_COLLECTIONS_CHECKS
                 AtomicSafetyHandle.CheckReadAndThrow(m_Safety);
 #endif
-                return _header->Count;
+                return (TrecsDictionaryHeader*)_slot->Address.ToPointer();
             }
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public bool ContainsKey(TKey key)
+        TrecsDictionaryHeader* WriteHeader
         {
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            get
+            {
 #if ENABLE_UNITY_COLLECTIONS_CHECKS
-            AtomicSafetyHandle.CheckReadAndThrow(m_Safety);
+                AtomicSafetyHandle.CheckWriteAndThrow(m_Safety);
 #endif
-            return TryGetIndexInternal(key, out _);
+                return (TrecsDictionaryHeader*)_slot->Address.ToPointer();
+            }
         }
+
+        public int Count
+        {
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            get => ReadHeader->Count;
+        }
+
+        public int Capacity
+        {
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            get => ReadHeader->EntryCapacity;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool ContainsKey(TKey key) =>
+            TrecsDictionaryLayout<TKey, TValue>.TryGetIndex(ReadHeader, key, out _);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public bool TryGetValue(TKey key, out TValue value)
         {
-#if ENABLE_UNITY_COLLECTIONS_CHECKS
-            AtomicSafetyHandle.CheckReadAndThrow(m_Safety);
-#endif
-            if (TryGetIndexInternal(key, out var index))
+            var header = ReadHeader;
+            if (TrecsDictionaryLayout<TKey, TValue>.TryGetIndex(header, key, out var index))
             {
-                value = _values[index];
+                value = TrecsDictionaryLayout<TKey, TValue>.Values(header)[index];
                 return true;
             }
             value = default;
@@ -147,409 +120,195 @@ namespace Trecs
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
             get
             {
-#if ENABLE_UNITY_COLLECTIONS_CHECKS
-                AtomicSafetyHandle.CheckReadAndThrow(m_Safety);
-#endif
+                var header = ReadHeader;
                 TrecsAssert.That(
-                    TryGetIndexInternal(key, out var index),
+                    TrecsDictionaryLayout<TKey, TValue>.TryGetIndex(header, key, out var index),
                     "Key not found in TrecsDictionary"
                 );
-                return _values[index];
+                return TrecsDictionaryLayout<TKey, TValue>.Values(header)[index];
             }
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            set
-            {
-#if ENABLE_UNITY_COLLECTIONS_CHECKS
-                AtomicSafetyHandle.CheckWriteAndThrow(m_Safety);
-#endif
-                AddValue(key, out var index);
-                _values[index] = value;
-                BumpVersion();
-            }
+            set => GetOrAdd(key) = value;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void Add(TKey key, in TValue value)
         {
-#if ENABLE_UNITY_COLLECTIONS_CHECKS
-            AtomicSafetyHandle.CheckWriteAndThrow(m_Safety);
-#endif
-            var added = AddValue(key, out var index);
+            var added = AddKey(key, out var header, out var index);
             TrecsDebugAssert.That(added, "Key already present in TrecsDictionary");
-            _values[index] = value;
-            BumpVersion();
+            TrecsDictionaryLayout<TKey, TValue>.Values(header)[index] = value;
+        }
+
+        /// <summary>Adds a missing key; the dictionary must have room.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void AddNoResize(TKey key, in TValue value)
+        {
+            var added = AddKeyNoResize(key, out var header, out var index);
+            TrecsDebugAssert.That(added, "Key already present in TrecsDictionary");
+            TrecsDictionaryLayout<TKey, TValue>.Values(header)[index] = value;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public bool TryAdd(TKey key, in TValue value)
         {
-#if ENABLE_UNITY_COLLECTIONS_CHECKS
-            AtomicSafetyHandle.CheckWriteAndThrow(m_Safety);
-#endif
-            var added = AddValue(key, out var index);
-            if (added)
-            {
-                _values[index] = value;
-                BumpVersion();
-            }
-            return added;
+            if (!AddKey(key, out var header, out var index))
+                return false;
+            TrecsDictionaryLayout<TKey, TValue>.Values(header)[index] = value;
+            return true;
+        }
+
+        /// <summary><see cref="TryAdd"/> that needs room when the key is missing.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool TryAddNoResize(TKey key, in TValue value)
+        {
+            if (!AddKeyNoResize(key, out var header, out var index))
+                return false;
+            TrecsDictionaryLayout<TKey, TValue>.Values(header)[index] = value;
+            return true;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public void Set(TKey key, in TValue value)
-        {
-#if ENABLE_UNITY_COLLECTIONS_CHECKS
-            AtomicSafetyHandle.CheckWriteAndThrow(m_Safety);
-#endif
-            TrecsAssert.That(
-                TryGetIndexInternal(key, out var index),
-                "Key not found in TrecsDictionary"
-            );
-            _values[index] = value;
-            BumpVersion();
-        }
+        public void Set(TKey key, in TValue value) => GetValueByRef(key) = value;
 
+        /// <summary>The value of <paramref name="key"/>, added as default when missing.</summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public ref TValue GetOrAdd(TKey key)
         {
-#if ENABLE_UNITY_COLLECTIONS_CHECKS
-            AtomicSafetyHandle.CheckWriteAndThrow(m_Safety);
-#endif
-            if (AddValue(key, out var index))
-                BumpVersion();
-            return ref _values[index];
+            AddKey(key, out var header, out var index);
+            return ref TrecsDictionaryLayout<TKey, TValue>.Values(header)[index];
+        }
+
+        /// <summary><see cref="GetOrAdd"/> that needs room when the key is missing.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public ref TValue GetOrAddNoResize(TKey key)
+        {
+            AddKeyNoResize(key, out var header, out var index);
+            return ref TrecsDictionaryLayout<TKey, TValue>.Values(header)[index];
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public ref TValue GetValueByRef(TKey key)
         {
-#if ENABLE_UNITY_COLLECTIONS_CHECKS
-            AtomicSafetyHandle.CheckWriteAndThrow(m_Safety);
-#endif
+            var header = WriteHeader;
             TrecsAssert.That(
-                TryGetIndexInternal(key, out var index),
+                TrecsDictionaryLayout<TKey, TValue>.TryGetIndex(header, key, out var index),
                 "Key not found in TrecsDictionary"
             );
-            return ref _values[index];
+            return ref TrecsDictionaryLayout<TKey, TValue>.Values(header)[index];
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public ref TValue GetValueAtIndex(int index)
         {
-#if ENABLE_UNITY_COLLECTIONS_CHECKS
-            AtomicSafetyHandle.CheckWriteAndThrow(m_Safety);
-#endif
+            var header = WriteHeader;
             TrecsDebugAssert.That(
-                (uint)index < (uint)_header->Count,
+                (uint)index < (uint)header->Count,
                 "NativeTrecsDictionaryWrite.GetValueAtIndex index {0} out of range (Count={1})",
                 index,
-                _header->Count
+                header->Count
             );
-            return ref _values[index];
+            return ref TrecsDictionaryLayout<TKey, TValue>.Values(header)[index];
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public TKey GetKeyAtIndex(int index)
         {
-#if ENABLE_UNITY_COLLECTIONS_CHECKS
-            AtomicSafetyHandle.CheckReadAndThrow(m_Safety);
-#endif
+            var header = ReadHeader;
             TrecsDebugAssert.That(
-                (uint)index < (uint)_header->Count,
+                (uint)index < (uint)header->Count,
                 "NativeTrecsDictionaryWrite.GetKeyAtIndex index {0} out of range (Count={1})",
                 index,
-                _header->Count
+                header->Count
             );
-            return _nodes[index].Key;
+            return TrecsDictionaryLayout<TKey, TValue>.Nodes(header)[index].Key;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public bool TryGetIndex(TKey key, out int findIndex)
-        {
-#if ENABLE_UNITY_COLLECTIONS_CHECKS
-            AtomicSafetyHandle.CheckReadAndThrow(m_Safety);
-#endif
-            return TryGetIndexInternal(key, out findIndex);
-        }
+        public bool TryGetIndex(TKey key, out int index) =>
+            TrecsDictionaryLayout<TKey, TValue>.TryGetIndex(ReadHeader, key, out index);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public bool Remove(TKey key)
+        public bool Remove(TKey key) =>
+            TrecsDictionaryLayout<TKey, TValue>.Remove(WriteHeader, key, out _);
+
+        public bool Remove(TKey key, out TValue removedValue) =>
+            TrecsDictionaryLayout<TKey, TValue>.Remove(WriteHeader, key, out removedValue);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void Clear() => TrecsDictionaryLayout<TKey, TValue>.Clear(WriteHeader);
+
+        /// <summary>
+        /// Grows the dictionary to hold at least <paramref name="minCapacity"/> entries,
+        /// doubling past the current capacity.
+        /// </summary>
+        public void EnsureCapacity(int minCapacity)
         {
-            return Remove(key, out _);
-        }
-
-        public bool Remove(TKey key, out TValue removedValue)
-        {
-#if ENABLE_UNITY_COLLECTIONS_CHECKS
-            AtomicSafetyHandle.CheckWriteAndThrow(m_Safety);
-#endif
-
-            if (_header->BucketCount == 0)
+            TrecsDebugAssert.That(minCapacity >= 0, "minCapacity must be non-negative");
+            if (minCapacity > WriteHeader->EntryCapacity)
             {
-                removedValue = default;
-                return false;
-            }
-
-            int hash = key.GetHashCode();
-            var bucketsLength = (uint)_header->BucketCount;
-            int bucketIndex = TrecsDictionary.Reduce(
-                (uint)hash,
-                bucketsLength,
-                _header->FastModMultiplier
-            );
-
-            int indexToRemove = _buckets[bucketIndex] - 1;
-            int itemAfterCurrent = -1;
-
-            while (indexToRemove != -1)
-            {
-                ref var node = ref _nodes[indexToRemove];
-                if (node.HashCode == hash && node.Key.Equals(key))
-                {
-                    if (_buckets[bucketIndex] - 1 == indexToRemove)
-                    {
-                        _buckets[bucketIndex] = node.Previous + 1;
-                    }
-                    else
-                    {
-                        _nodes[itemAfterCurrent].Previous = node.Previous;
-                    }
-                    break;
-                }
-                itemAfterCurrent = indexToRemove;
-                indexToRemove = node.Previous;
-            }
-
-            if (indexToRemove == -1)
-            {
-                removedValue = default;
-                return false;
-            }
-
-            removedValue = _values[indexToRemove];
-            var lastIndex = _header->Count - 1;
-
-            if (indexToRemove != lastIndex)
-            {
-                ref var nodeToMove = ref _nodes[lastIndex];
-                var movingBucketIndex = TrecsDictionary.Reduce(
-                    (uint)nodeToMove.HashCode,
-                    bucketsLength,
-                    _header->FastModMultiplier
+                TrecsDictionaryLayout<TKey, TValue>.GrowDetached(
+                    _slot,
+                    _handle,
+                    _detachLog,
+                    minCapacity
                 );
-
-                var linkedListIter = _buckets[movingBucketIndex] - 1;
-                if (linkedListIter == lastIndex)
-                {
-                    _buckets[movingBucketIndex] = indexToRemove + 1;
-                }
-
-                while (
-                    _nodes[linkedListIter].Previous != -1
-                    && _nodes[linkedListIter].Previous != lastIndex
-                )
-                {
-                    linkedListIter = _nodes[linkedListIter].Previous;
-                }
-
-                if (_nodes[linkedListIter].Previous != -1)
-                {
-                    _nodes[linkedListIter].Previous = indexToRemove;
-                }
-
-                _nodes[indexToRemove] = nodeToMove;
-                _values[indexToRemove] = _values[lastIndex];
             }
-
-            _header->Count--;
-            BumpVersion();
-            return true;
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public void Clear()
+        public TrecsDictionaryKeys<TKey> Keys
         {
-#if ENABLE_UNITY_COLLECTIONS_CHECKS
-            AtomicSafetyHandle.CheckWriteAndThrow(m_Safety);
-#endif
-            if (_header->Count == 0)
-                return;
-
-            _header->Count = 0;
-            _header->Collisions = 0;
-            if (_buckets != null && _header->BucketCount > 0)
-            {
-                UnsafeUtility.MemClear(_buckets, _header->BucketCount * sizeof(int));
-            }
-            BumpVersion();
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public Enumerator GetEnumerator()
-        {
-#if ENABLE_UNITY_COLLECTIONS_CHECKS
-            AtomicSafetyHandle.CheckReadAndThrow(m_Safety);
-#endif
-            return new Enumerator(_nodes, _values, _header->Count);
-        }
-
-        // ─── Internal ────────────────────────────────────────────────
-
-        bool AddValue(TKey key, out int indexSet)
-        {
-            TrecsAssert.That(
-                _header->BucketCount > 0 && _header->EntryCapacity > 0,
-                "NativeTrecsDictionaryWrite: dictionary has no capacity. "
-                    + "Call EnsureCapacity on the main thread before scheduling."
-            );
-
-            int hash = key.GetHashCode();
-            int bucketIndex = TrecsDictionary.Reduce(
-                (uint)hash,
-                (uint)_header->BucketCount,
-                _header->FastModMultiplier
-            );
-
-            var valueIndex = _buckets[bucketIndex] - 1;
-
-            if (valueIndex == -1)
-            {
-                TrecsAssert.That(
-                    _header->Count < _header->EntryCapacity,
-                    "NativeTrecsDictionaryWrite: capacity exceeded ({0}/{1}). "
-                        + "Pre-size via EnsureCapacity before scheduling.",
-                    _header->Count,
-                    _header->EntryCapacity
-                );
-                _nodes[_header->Count] = new IterableDictionaryNode<TKey>(key, hash);
-                _values[_header->Count] = default;
-            }
-            else
-            {
-                int currentValueIndex = valueIndex;
-                do
-                {
-                    ref var node = ref _nodes[currentValueIndex];
-                    if (node.HashCode == hash && node.Key.Equals(key))
-                    {
-                        indexSet = currentValueIndex;
-                        return false;
-                    }
-                    currentValueIndex = node.Previous;
-                } while (currentValueIndex != -1);
-
-                _header->Collisions++;
-                TrecsAssert.That(
-                    _header->Count < _header->EntryCapacity,
-                    "NativeTrecsDictionaryWrite: capacity exceeded ({0}/{1}). "
-                        + "Pre-size via EnsureCapacity before scheduling.",
-                    _header->Count,
-                    _header->EntryCapacity
-                );
-                _nodes[_header->Count] = new IterableDictionaryNode<TKey>(key, hash, valueIndex);
-                _values[_header->Count] = default;
-            }
-
-            indexSet = _header->Count;
-            _buckets[bucketIndex] = indexSet + 1;
-            _header->Count++;
-
-            return true;
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        bool TryGetIndexInternal(TKey key, out int findIndex)
-        {
-            if (_header->BucketCount == 0)
-            {
-                findIndex = 0;
-                return false;
-            }
-
-            int hash = key.GetHashCode();
-            int bucketIndex = TrecsDictionary.Reduce(
-                (uint)hash,
-                (uint)_header->BucketCount,
-                _header->FastModMultiplier
-            );
-            int valueIndex = _buckets[bucketIndex] - 1;
-
-            while (valueIndex != -1)
-            {
-                ref var node = ref _nodes[valueIndex];
-                if (node.HashCode == hash && node.Key.Equals(key))
-                {
-                    findIndex = valueIndex;
-                    return true;
-                }
-                valueIndex = node.Previous;
-            }
-
-            findIndex = 0;
-            return false;
-        }
-
-        // ─── Enumerator ──────────────────────────────────────────────
-
-        public struct Enumerator
-        {
-            [NativeDisableUnsafePtrRestriction]
-            readonly IterableDictionaryNode<TKey>* _nodes;
-
-            [NativeDisableUnsafePtrRestriction]
-            readonly TValue* _values;
-
-            readonly int _count;
-            int _index;
-
-            internal Enumerator(IterableDictionaryNode<TKey>* nodes, TValue* values, int count)
-            {
-                _nodes = nodes;
-                _values = values;
-                _count = count;
-                _index = -1;
-            }
-
-            public KeyValuePair Current
-            {
-                [MethodImpl(MethodImplOptions.AggressiveInlining)]
-                get => new KeyValuePair(_nodes[_index].Key, _values, _index);
-            }
-
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            public bool MoveNext()
+            get
             {
-                _index++;
-                return _index < _count;
+                var header = ReadHeader;
+                return new TrecsDictionaryKeys<TKey>(
+                    TrecsDictionaryLayout<TKey, TValue>.Nodes(header),
+                    header->Count
+                );
             }
         }
 
-        public readonly struct KeyValuePair
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public TrecsDictionaryEnumerator<TKey, TValue> GetEnumerator()
         {
-            [NativeDisableUnsafePtrRestriction]
-            readonly TValue* _valuesPtr;
-            readonly int _index;
+            var header = WriteHeader;
+            return new TrecsDictionaryEnumerator<TKey, TValue>(
+                TrecsDictionaryLayout<TKey, TValue>.Nodes(header),
+                TrecsDictionaryLayout<TKey, TValue>.Values(header),
+                header->Count
+            );
+        }
 
-            public readonly TKey Key;
-
-            internal KeyValuePair(TKey key, TValue* valuesPtr, int index)
+        // False with the key's index when present; else appends it, growing when full.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        bool AddKey(in TKey key, out TrecsDictionaryHeader* header, out int index)
+        {
+            header = WriteHeader;
+            var hash = key.GetHashCode();
+            if (TrecsDictionaryLayout<TKey, TValue>.TryFind(header, key, hash, out index))
+                return false;
+            if (header->Count == header->EntryCapacity)
             {
-                Key = key;
-                _valuesPtr = valuesPtr;
-                _index = index;
+                header = TrecsDictionaryLayout<TKey, TValue>.GrowDetached(
+                    _slot,
+                    _handle,
+                    _detachLog,
+                    header->Count + 1
+                );
             }
+            index = TrecsDictionaryLayout<TKey, TValue>.AppendKey(header, key, hash);
+            return true;
+        }
 
-            public void Deconstruct(out TKey key, out TValue value)
-            {
-                key = Key;
-                value = Value;
-            }
-
-            public ref TValue Value
-            {
-                [MethodImpl(MethodImplOptions.AggressiveInlining)]
-                get => ref _valuesPtr[_index];
-            }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        bool AddKeyNoResize(in TKey key, out TrecsDictionaryHeader* header, out int index)
+        {
+            header = WriteHeader;
+            var hash = key.GetHashCode();
+            if (TrecsDictionaryLayout<TKey, TValue>.TryFind(header, key, hash, out index))
+                return false;
+            index = TrecsDictionaryLayout<TKey, TValue>.AppendKey(header, key, hash);
+            return true;
         }
     }
 }

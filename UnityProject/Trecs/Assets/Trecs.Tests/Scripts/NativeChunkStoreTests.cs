@@ -708,11 +708,11 @@ namespace Trecs.Tests
                 NAssert.AreEqual(2, dst.NumLiveAllocations);
                 var hugePayload = dst.ResolvePayload(hugeHandle);
                 NAssert.AreEqual(1, hugePayload.OwnsWholePage);
-                NAssert.AreEqual(7, hugePayload.TypeHash);
+                NAssert.AreEqual(7, dst.ResolveEntry(hugeHandle).TypeHash);
 
                 var extPayload = dst.ResolvePayload(extHandle);
                 NAssert.AreEqual(1, extPayload.OwnsWholePage);
-                NAssert.AreEqual(9, extPayload.TypeHash);
+                NAssert.AreEqual(9, dst.ResolveEntry(extHandle).TypeHash);
                 NAssert.AreEqual(0xCAFE, Marshal.ReadInt32(dst.ResolveEntry(extHandle).Address));
             }
         }

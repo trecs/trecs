@@ -1,131 +1,73 @@
 using System;
-using System.ComponentModel;
 using System.Runtime.CompilerServices;
-using Trecs.Collections;
 using Trecs.Internal;
 using Unity.Collections.LowLevel.Unsafe;
 
 namespace Trecs
 {
+    /// <summary>
+    /// Main-thread read-only view over a <see cref="TrecsDictionary{TKey, TValue}"/>. Reaches
+    /// the block through the allocation's side-table entry on every access and asserts the
+    /// allocation is still live. In a job use <see cref="NativeTrecsDictionaryRead{TKey, TValue}"/>.
+    /// </summary>
     public readonly unsafe ref struct TrecsDictionaryRead<TKey, TValue>
         where TKey : unmanaged, IEquatable<TKey>
         where TValue : unmanaged
     {
-        readonly TrecsDictionaryHeader* _header;
-        readonly IterableDictionaryNode<TKey>* _nodes;
-        readonly TValue* _values;
-        readonly int* _buckets;
-        readonly ushort _capturedVersion;
-        readonly NativeHeapEntry* _headerSlot;
-        readonly byte _capturedGeneration;
+        readonly NativeHeapEntry* _slot;
+        readonly PtrHandle _handle;
 
 #if ENABLE_UNITY_COLLECTIONS_CHECKS
         readonly AtomicSafetyHandle m_Safety;
-#endif
 
-#if ENABLE_UNITY_COLLECTIONS_CHECKS
-        [EditorBrowsable(EditorBrowsableState.Never)]
-        public TrecsDictionaryRead(
-            TrecsDictionaryHeader* header,
-            IterableDictionaryNode<TKey>* nodes,
-            TValue* values,
-            int* buckets,
-            NativeHeapEntry* headerSlot,
-            byte capturedGeneration,
+        internal TrecsDictionaryRead(
+            NativeHeapEntry* slot,
+            PtrHandle handle,
             AtomicSafetyHandle safety
         )
         {
-            _header = header;
-            _nodes = nodes;
-            _values = values;
-            _buckets = buckets;
-            _capturedVersion = header->Version;
-            _headerSlot = headerSlot;
-            _capturedGeneration = capturedGeneration;
+            _slot = slot;
+            _handle = handle;
             m_Safety = safety;
         }
 #else
-        [EditorBrowsable(EditorBrowsableState.Never)]
-        public TrecsDictionaryRead(
-            TrecsDictionaryHeader* header,
-            IterableDictionaryNode<TKey>* nodes,
-            TValue* values,
-            int* buckets,
-            NativeHeapEntry* headerSlot,
-            byte capturedGeneration
-        )
+        internal TrecsDictionaryRead(NativeHeapEntry* slot, PtrHandle handle)
         {
-            _header = header;
-            _nodes = nodes;
-            _values = values;
-            _buckets = buckets;
-            _capturedVersion = header->Version;
-            _headerSlot = headerSlot;
-            _capturedGeneration = capturedGeneration;
+            _slot = slot;
+            _handle = handle;
         }
 #endif
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        void CheckSlotAlive()
+        TrecsDictionaryHeader* Header
         {
-            TrecsAssert.That(
-                _headerSlot->Generation == _capturedGeneration && _headerSlot->InUse == 1,
-                "TrecsDictionaryRead is stale: the underlying TrecsDictionary allocation "
-                    + "has been freed since this wrapper was opened (captured slot gen {0}, "
-                    + "current {1}, InUse {2}).",
-                _capturedGeneration,
-                _headerSlot->Generation,
-                _headerSlot->InUse
-            );
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        void CheckVersion()
-        {
-            TrecsAssert.That(
-                _header->Version == _capturedVersion,
-                "TrecsDictionaryRead is stale: the dictionary was mutated since this "
-                    + "wrapper was opened (captured version {0}, current {1}). Re-open "
-                    + "the wrapper after any mutation.",
-                _capturedVersion,
-                _header->Version
-            );
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        void CheckReadAccess()
-        {
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            get
+            {
 #if ENABLE_UNITY_COLLECTIONS_CHECKS
-            AtomicSafetyHandle.CheckReadAndThrow(m_Safety);
+                AtomicSafetyHandle.CheckReadAndThrow(m_Safety);
 #endif
-            CheckSlotAlive();
-            CheckVersion();
+                NativeHeapResolver.AssertSlotLive(_slot, _handle);
+                return (TrecsDictionaryHeader*)_slot->Address.ToPointer();
+            }
         }
 
         public int Count
         {
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            get
-            {
-                CheckReadAccess();
-                return _header->Count;
-            }
+            get => Header->Count;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public bool ContainsKey(TKey key)
-        {
-            CheckReadAccess();
-            return TryGetIndexInternal(key, out _);
-        }
+        public bool ContainsKey(TKey key) =>
+            TrecsDictionaryLayout<TKey, TValue>.TryGetIndex(Header, key, out _);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public bool TryGetValue(TKey key, out TValue value)
         {
-            CheckReadAccess();
-            if (TryGetIndexInternal(key, out var index))
+            var header = Header;
+            if (TrecsDictionaryLayout<TKey, TValue>.TryGetIndex(header, key, out var index))
             {
-                value = _values[index];
+                value = TrecsDictionaryLayout<TKey, TValue>.Values(header)[index];
                 return true;
             }
             value = default;
@@ -137,192 +79,67 @@ namespace Trecs
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
             get
             {
-                CheckReadAccess();
+                var header = Header;
                 TrecsAssert.That(
-                    TryGetIndexInternal(key, out var index),
+                    TrecsDictionaryLayout<TKey, TValue>.TryGetIndex(header, key, out var index),
                     "Key not found in TrecsDictionary"
                 );
-                return _values[index];
+                return TrecsDictionaryLayout<TKey, TValue>.Values(header)[index];
             }
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public bool TryGetIndex(TKey key, out int findIndex)
-        {
-            CheckReadAccess();
-            return TryGetIndexInternal(key, out findIndex);
-        }
+        public bool TryGetIndex(TKey key, out int index) =>
+            TrecsDictionaryLayout<TKey, TValue>.TryGetIndex(Header, key, out index);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public ref readonly TValue GetValueAtIndex(int index)
         {
-            CheckReadAccess();
+            var header = Header;
             TrecsDebugAssert.That(
-                (uint)index < (uint)_header->Count,
+                (uint)index < (uint)header->Count,
                 "TrecsDictionaryRead.GetValueAtIndex index {0} out of range (Count={1})",
                 index,
-                _header->Count
+                header->Count
             );
-            return ref _values[index];
+            return ref TrecsDictionaryLayout<TKey, TValue>.Values(header)[index];
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public TKey GetKeyAtIndex(int index)
         {
-            CheckReadAccess();
+            var header = Header;
             TrecsDebugAssert.That(
-                (uint)index < (uint)_header->Count,
+                (uint)index < (uint)header->Count,
                 "TrecsDictionaryRead.GetKeyAtIndex index {0} out of range (Count={1})",
                 index,
-                _header->Count
+                header->Count
             );
-            return _nodes[index].Key;
+            return TrecsDictionaryLayout<TKey, TValue>.Nodes(header)[index].Key;
         }
 
-        public KeyEnumerable Keys
+        public TrecsDictionaryKeys<TKey> Keys
         {
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
             get
             {
-                CheckReadAccess();
-                return new KeyEnumerable(_nodes, _header->Count);
+                var header = Header;
+                return new TrecsDictionaryKeys<TKey>(
+                    TrecsDictionaryLayout<TKey, TValue>.Nodes(header),
+                    header->Count
+                );
             }
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public Enumerator GetEnumerator()
+        public TrecsDictionaryReadEnumerator<TKey, TValue> GetEnumerator()
         {
-            CheckReadAccess();
-            return new Enumerator(_nodes, _values, _header->Count);
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        bool TryGetIndexInternal(TKey key, out int findIndex)
-        {
-            if (_header->BucketCount == 0)
-            {
-                findIndex = 0;
-                return false;
-            }
-
-            int hash = key.GetHashCode();
-            int bucketIndex = TrecsDictionary.Reduce(
-                (uint)hash,
-                (uint)_header->BucketCount,
-                _header->FastModMultiplier
+            var header = Header;
+            return new TrecsDictionaryReadEnumerator<TKey, TValue>(
+                TrecsDictionaryLayout<TKey, TValue>.Nodes(header),
+                TrecsDictionaryLayout<TKey, TValue>.Values(header),
+                header->Count
             );
-            int valueIndex = _buckets[bucketIndex] - 1;
-
-            while (valueIndex != -1)
-            {
-                ref var node = ref _nodes[valueIndex];
-                if (node.HashCode == hash && node.Key.Equals(key))
-                {
-                    findIndex = valueIndex;
-                    return true;
-                }
-                valueIndex = node.Previous;
-            }
-
-            findIndex = 0;
-            return false;
-        }
-
-        public readonly ref struct KeyEnumerable
-        {
-            readonly IterableDictionaryNode<TKey>* _nodes;
-            readonly int _count;
-
-            internal KeyEnumerable(IterableDictionaryNode<TKey>* nodes, int count)
-            {
-                _nodes = nodes;
-                _count = count;
-            }
-
-            public KeyEnumerator GetEnumerator() => new KeyEnumerator(_nodes, _count);
-        }
-
-        public ref struct KeyEnumerator
-        {
-            readonly IterableDictionaryNode<TKey>* _nodes;
-            readonly int _count;
-            int _index;
-
-            internal KeyEnumerator(IterableDictionaryNode<TKey>* nodes, int count)
-            {
-                _nodes = nodes;
-                _count = count;
-                _index = -1;
-            }
-
-            public TKey Current
-            {
-                [MethodImpl(MethodImplOptions.AggressiveInlining)]
-                get => _nodes[_index].Key;
-            }
-
-            [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            public bool MoveNext()
-            {
-                _index++;
-                return _index < _count;
-            }
-        }
-
-        public ref struct Enumerator
-        {
-            readonly IterableDictionaryNode<TKey>* _nodes;
-            readonly TValue* _values;
-            readonly int _count;
-            int _index;
-
-            internal Enumerator(IterableDictionaryNode<TKey>* nodes, TValue* values, int count)
-            {
-                _nodes = nodes;
-                _values = values;
-                _count = count;
-                _index = -1;
-            }
-
-            public KeyValuePair Current
-            {
-                [MethodImpl(MethodImplOptions.AggressiveInlining)]
-                get => new KeyValuePair(_nodes[_index].Key, _values, _index);
-            }
-
-            [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            public bool MoveNext()
-            {
-                _index++;
-                return _index < _count;
-            }
-        }
-
-        public readonly ref struct KeyValuePair
-        {
-            readonly TValue* _valuesPtr;
-            readonly int _index;
-
-            public readonly TKey Key;
-
-            internal KeyValuePair(TKey key, TValue* valuesPtr, int index)
-            {
-                Key = key;
-                _valuesPtr = valuesPtr;
-                _index = index;
-            }
-
-            public void Deconstruct(out TKey key, out TValue value)
-            {
-                key = Key;
-                value = Value;
-            }
-
-            public ref readonly TValue Value
-            {
-                [MethodImpl(MethodImplOptions.AggressiveInlining)]
-                get => ref _valuesPtr[_index];
-            }
         }
     }
 }

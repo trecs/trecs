@@ -25,7 +25,8 @@ All three collection types share these traits:
 
 - **Handle-sized structs.** The struct on the component is a lightweight handle (4-8 bytes). Backing data lives on the world's native heap.
 - **Read/Write wrappers.** Access goes through `Read(...)` / `Write(...)` methods that return typed wrappers, so Unity's job-safety system can track conflicts.
-- **Managed and native flavors.** Main-thread wrappers (`TrecsListWrite<T>`, etc.) auto-grow on overflow. Burst-safe wrappers (`NativeTrecsListWrite<T>`, etc.) do **not** auto-grow — pre-size with `EnsureCapacity` on the main thread before scheduling.
+- **Managed and native flavors.** Main-thread wrappers (`TrecsListWrite<T>`, etc.) and Burst-safe wrappers (`NativeTrecsListWrite<T>`, etc.) both grow on overflow, in a job too. The handle never changes. `AddNoResize` (and `TryAddNoResize`, `GetOrAddNoResize` on dictionaries) skip the capacity check for hot loops that sized the collection first.
+- **One heap slot per collection.** Header and elements share one block. Capacity fills the slot, so `Alloc` with capacity 0 still holds a few small elements.
 - **Manual disposal.** Not auto-freed when an entity is removed. Dispose in an `OnRemoved` observer — see [Pointers — cleanup is manual](pointers.md#cleanup-is-manual-for-entity-owned-pointers).
 - **`Write` is `ref this`.** The call site needs a writable reference to the handle — same rule as [the gotcha for `NativeUniquePtr`](../guides/gotchas.md#mutating-a-nativeuniqueptrt-needs-write-access-to-the-owning-component).
 
@@ -76,7 +77,7 @@ static void Execute(ref CCollisionPairBuffer buf, in NativeWorldAccessor world)
 
 ### Capacity
 
-Main-thread `Add` auto-grows (doubling). In a Burst job, `Add` throws on overflow — pre-size with `list.EnsureCapacity(World, minCapacity)` on the main thread before scheduling.
+`Add` doubles the capacity when full, on the main thread and in Burst jobs. A job grows into a block outside the heap's pages; the heap moves it back into its pages at the next phase boundary, in handle order, so snapshots and lockstep peers stay identical. `list.EnsureCapacity(World, minCapacity)` sizes up front; `AddNoResize` then skips the capacity check.
 
 ## `TrecsArray<T>`
 
@@ -146,7 +147,7 @@ write.Clear();
 
 Other write operations: `TryAdd`, `Set` (update existing, throws if missing), `GetOrAdd` (get-or-create returning `ref TValue`), `GetValueByRef`.
 
-Inside a Burst job, `NativeTrecsDictionaryWrite` provides the same API but does **not** auto-grow — pre-size with `dict.EnsureCapacity(World, minCapacity)` before scheduling.
+Inside a Burst job, `NativeTrecsDictionaryWrite` provides the same API and grows the same way as a list.
 
 ### Add vs TryAdd vs Set vs indexer
 

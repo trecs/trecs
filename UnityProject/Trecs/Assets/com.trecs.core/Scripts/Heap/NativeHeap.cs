@@ -9,6 +9,7 @@ using Unity.Burst;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
 using Unity.Jobs;
+using Unity.Mathematics;
 
 namespace Trecs.Internal
 {
@@ -35,6 +36,10 @@ namespace Trecs.Internal
     /// behaviour, same as <c>NativeList&lt;T&gt;.Dispose()</c>. Callers must complete any
     /// jobs using the handle before freeing it.
     /// </para>
+    ///
+    /// <para><b>Growth in jobs.</b> A job grows an allocation into a <see cref="DetachedBlock"/>
+    /// outside the pages; <see cref="AdoptDetached"/> moves it back at the next phase
+    /// boundary.</para>
     ///
     /// <para><b>Threading invariant.</b> Every mutating API is main-thread only.
     /// Concurrency with Burst jobs that resolve via <see cref="NativeHeapResolver"/>
@@ -71,6 +76,7 @@ namespace Trecs.Internal
     {
         static readonly TrecsProfilerMarker _allocMarker = new("NativeHeap.Alloc");
         static readonly TrecsProfilerMarker _freeMarker = new("NativeHeap.Free");
+        static readonly TrecsProfilerMarker _adoptDetachedMarker = new("NativeHeap.AdoptDetached");
 
         readonly TrecsLog _log;
 
@@ -80,27 +86,9 @@ namespace Trecs.Internal
         internal const int MaxBucketSlotSize = 64 * 1024;
         internal const int TargetSlotsPerPage = 64;
         internal const int MinPageSize = 4 * 1024; // never allocate a page smaller than this
+        const int BucketCount = 13; // MinBucketSlotSize << i up to MaxBucketSlotSize
 
-        static readonly int[] BucketSlotSizes =
-        {
-            16,
-            32,
-            64,
-            128,
-            256,
-            512,
-            1024,
-            2048,
-            4096,
-            8192,
-            16384,
-            32768,
-            65536,
-        };
-
-        readonly Bucket[] _buckets;
-        NativeList<Page> _pages;
-        readonly Stack<int> _freePageIds = new();
+        PageStore _store;
 
         // Side-table slot recycling. Slot 0 is reserved as the "null" slot — never returned.
         readonly Stack<int> _freeSideTableSlots = new();
@@ -127,6 +115,7 @@ namespace Trecs.Internal
         // chunks, so jobs reading via the resolver can keep resolving handles concurrent
         // with main-thread Allocs that materialise additional slots.
         NativeArray<IntPtr> _chunkDirectory;
+        readonly unsafe NativeHeapDetachLog* _detachLog;
         int _sideTableLength;
         NativeHeapResolver _resolver;
         bool _isDisposed;
@@ -142,19 +131,7 @@ namespace Trecs.Internal
         public unsafe NativeHeap(TrecsLog log)
         {
             _log = log;
-            _buckets = new Bucket[BucketSlotSizes.Length];
-            for (int i = 0; i < BucketSlotSizes.Length; i++)
-            {
-                var slotSize = BucketSlotSizes[i];
-                var pageSize = Math.Max(MinPageSize, slotSize * TargetSlotsPerPage);
-                var slotsPerPage = pageSize / slotSize;
-                _buckets[i] = new Bucket
-                {
-                    SlotSize = slotSize,
-                    SlotsPerPage = slotsPerPage,
-                    PageSizeBytes = pageSize,
-                };
-            }
+            _store = PageStore.Create();
 
             // Fixed-capacity directory: 16K pointers = 128 KB upfront, covering the
             // entire 24-bit index space. The directory itself never moves; chunks
@@ -165,7 +142,6 @@ namespace Trecs.Internal
                 NativeArrayOptions.ClearMemory
             );
 
-            _pages = new NativeList<Page>(64, Allocator.Persistent);
             _densePayloads = new NativeList<NativeHeapEntryPayload>(64, Allocator.Persistent);
             _denseSlotIndices = new NativeList<int>(64, Allocator.Persistent);
             _sparseToDense = new NativeList<int>(1, Allocator.Persistent);
@@ -176,7 +152,17 @@ namespace Trecs.Internal
             // be allocated first.
             EnsureSideTableLength(1);
 
-            _resolver = new NativeHeapResolver(_chunkDirectory);
+            _detachLog = (NativeHeapDetachLog*)
+                UnsafeUtility.MallocTracked(
+                    sizeof(NativeHeapDetachLog),
+                    UnsafeUtility.AlignOf<long>(),
+                    Allocator.Persistent,
+                    0
+                );
+            UnsafeUtility.MemClear(_detachLog, sizeof(NativeHeapDetachLog));
+            DetachedBlock.InitArenas(_detachLog);
+
+            _resolver = new NativeHeapResolver(_chunkDirectory, _detachLog);
         }
 
         public int NumLiveAllocations
@@ -193,7 +179,7 @@ namespace Trecs.Internal
             get
             {
                 TrecsDebugAssert.That(!_isDisposed);
-                return _pages.Length - _freePageIds.Count;
+                return _store.Pages.Length - _store.FreePageIds.Length;
             }
         }
 
@@ -202,7 +188,7 @@ namespace Trecs.Internal
         /// density, total reserved bytes. Intended for benchmarking and diagnostics only;
         /// kept <c>internal</c> so it isn't part of the public API surface yet.
         /// </summary>
-        internal HeapStatistics GetStatistics()
+        internal unsafe HeapStatistics GetStatistics()
         {
             TrecsDebugAssert.That(!_isDisposed);
             TrecsDebugAssert.That(
@@ -210,19 +196,19 @@ namespace Trecs.Internal
                 "NativeHeap.GetStatistics must be called from the main thread"
             );
 
-            var bucketStats = new BucketStatistics[_buckets.Length];
+            var bucketStats = new BucketStatistics[BucketCount];
             long totalReserved = 0;
 
-            for (int b = 0; b < _buckets.Length; b++)
+            for (int b = 0; b < BucketCount; b++)
             {
-                var bucket = _buckets[b];
+                var bucket = _store.Buckets[b];
                 int pageCount = 0;
                 int liveSlotCount = 0;
                 int freeSlotCount = 0;
                 long reservedBytes = 0;
                 foreach (var pageId in bucket.PageIds)
                 {
-                    var page = _pages[pageId];
+                    var page = _store.Pages[pageId];
                     if (page.Address == IntPtr.Zero)
                     {
                         continue;
@@ -246,9 +232,9 @@ namespace Trecs.Internal
 
             int numHuge = 0;
             long hugeReserved = 0;
-            for (int pageId = 0; pageId < _pages.Length; pageId++)
+            for (int pageId = 0; pageId < _store.Pages.Length; pageId++)
             {
-                var page = _pages[pageId];
+                var page = _store.Pages[pageId];
                 if (page.Address == IntPtr.Zero || page.BucketIdx >= 0)
                 {
                     continue;
@@ -261,7 +247,7 @@ namespace Trecs.Internal
             return new HeapStatistics
             {
                 LiveAllocations = _liveCount,
-                NumPages = _pages.Length - _freePageIds.Count,
+                NumPages = _store.Pages.Length - _store.FreePageIds.Length,
                 NumHugePages = numHuge,
                 SideTableLength = _sideTableLength,
                 FreeSideTableSlots = _freeSideTableSlots.Count,
@@ -300,10 +286,10 @@ namespace Trecs.Internal
             // Pass 1: reserve a header + per-slot bool block for each live page.
             // pageIdToHeaderIdx is keyed by raw pageId (which may have gaps due to
             // reclaimed pages) and maps into the dense outPages list.
-            var pageIdToHeaderIdx = new int[_pages.Length];
-            for (int pageId = 0; pageId < _pages.Length; pageId++)
+            var pageIdToHeaderIdx = new int[_store.Pages.Length];
+            for (int pageId = 0; pageId < _store.Pages.Length; pageId++)
             {
-                var page = _pages[pageId];
+                var page = _store.Pages[pageId];
                 if (page.Address == IntPtr.Zero)
                 {
                     pageIdToHeaderIdx[pageId] = -1;
@@ -407,27 +393,16 @@ namespace Trecs.Internal
                 "NativeHeap.Alloc must be called from the main thread"
             );
 
-            int pageId;
-            int slotIdx;
-            int bucketIdx;
-            bool ownsWholePage;
-            int slotByteSize;
-
-            var neededSlotSize = Math.Max(size, alignment);
-            if (neededSlotSize > MaxBucketSlotSize)
-            {
-                AllocHugePage(neededSlotSize, alignment, out pageId, out slotIdx, out address);
-                bucketIdx = -1;
-                ownsWholePage = true;
-                slotByteSize = neededSlotSize;
-            }
-            else
-            {
-                bucketIdx = SelectBucket(neededSlotSize);
-                AllocFromBucket(bucketIdx, out pageId, out slotIdx, out address);
-                ownsWholePage = false;
-                slotByteSize = _buckets[bucketIdx].SlotSize;
-            }
+            AllocSlot(
+                size,
+                alignment,
+                out var pageId,
+                out var slotIdx,
+                out var bucketIdx,
+                out var ownsWholePage,
+                out var slotByteSize,
+                out address
+            );
 
             // Zero the entire slot — not just the caller's requested `size` — so any tail
             // bytes (between size and slotByteSize, or past Count*ElementSize for
@@ -477,13 +452,9 @@ namespace Trecs.Internal
             _densePayloads.Add(
                 new NativeHeapEntryPayload
                 {
-                    TypeHash = typeHash,
-                    Generation = nextGen,
-                    InUse = 1,
-                    OwnsWholePage = (byte)(ownsWholePage ? 1 : 0),
-                    _padding = 0,
                     PageId = pageId,
-                    SlotIndex = slotIdx,
+                    SlotIndex = (ushort)slotIdx,
+                    OwnsWholePage = (byte)(ownsWholePage ? 1 : 0),
                 }
             );
 
@@ -504,6 +475,191 @@ namespace Trecs.Internal
             );
 
             return new PtrHandle(handleValue);
+        }
+
+        void AllocSlot(
+            int size,
+            int alignment,
+            out int pageId,
+            out int slotIdx,
+            out int bucketIdx,
+            out bool ownsWholePage,
+            out int slotByteSize,
+            out IntPtr address
+        ) =>
+            _store.AllocSlot(
+                size,
+                alignment,
+                out pageId,
+                out slotIdx,
+                out bucketIdx,
+                out ownsWholePage,
+                out slotByteSize,
+                out address
+            );
+
+        /// <summary>
+        /// Moves a live allocation to a new slot of <paramref name="newSize"/> bytes, keeping
+        /// its handle and safety handle. Copies the first <paramref name="copyBytes"/> bytes
+        /// and zeroes the rest. Main thread; no job may hold the allocation.
+        /// </summary>
+        public unsafe void* Reallocate(PtrHandle handle, int newSize, int alignment, int copyBytes)
+        {
+            TrecsDebugAssert.That(!_isDisposed);
+            TrecsDebugAssert.That(
+                UnityThreadHelper.IsMainThread,
+                "NativeHeap.Reallocate must be called from the main thread"
+            );
+            NativeHeapResolver.DecodeHandle(handle, out var idxU, out var gen);
+            var idx = (int)idxU;
+            var slot = GetEntryPtr(idx);
+            TrecsAssert.That(
+                slot->InUse == 1 && slot->Generation == gen,
+                "Reallocate: handle {0} is freed or stale",
+                handle.Value
+            );
+            var payload =
+                (NativeHeapEntryPayload*)_densePayloads.GetUnsafePtr() + _sparseToDense[idx];
+#if ENABLE_UNITY_COLLECTIONS_CHECKS
+            AtomicSafetyHandle.CheckDeallocateAndThrow(slot->Safety);
+            TrecsDebugAssert.That(
+                payload->OwnsWholePage == 0
+                    || !_externalAddresses.Contains(_store.Pages[payload->PageId].Address),
+                "Reallocate: handle {0} owns an external pointer",
+                handle.Value
+            );
+#endif
+            return MoveToNewSlot(ref _store, slot, payload, newSize, alignment, copyBytes);
+        }
+
+        static unsafe void* MoveToNewSlot(
+            ref PageStore store,
+            NativeHeapEntry* slot,
+            NativeHeapEntryPayload* payload,
+            int newSize,
+            int alignment,
+            int copyBytes
+        )
+        {
+            TrecsDebugAssert.That(
+                copyBytes >= 0 && copyBytes <= newSize,
+                "MoveToNewSlot: copyBytes {0} outside [0, {1}]",
+                copyBytes,
+                newSize
+            );
+            store.AllocSlot(
+                newSize,
+                alignment,
+                out var pageId,
+                out var slotIdx,
+                out _,
+                out var ownsWholePage,
+                out var slotByteSize,
+                out var address
+            );
+            var dst = (byte*)address.ToPointer();
+            UnsafeUtility.MemCpy(dst, slot->Address.ToPointer(), copyBytes);
+            UnsafeUtility.MemClear(dst + copyBytes, slotByteSize - copyBytes);
+
+            store.ReturnSlot(payload->PageId, payload->SlotIndex, payload->OwnsWholePage != 0);
+            payload->PageId = pageId;
+            payload->SlotIndex = (ushort)slotIdx;
+            payload->OwnsWholePage = (byte)(ownsWholePage ? 1 : 0);
+
+            slot->Address = address;
+            slot->IsDetached = 0;
+            return dst;
+        }
+
+        /// <summary>
+        /// Moves every detached block (grown by a job since the last call) into a page
+        /// slot, in side-table order so placement matches on every peer, then frees the
+        /// arenas. Main thread, no job running: call at each phase boundary. No work when
+        /// nothing was detached.
+        /// </summary>
+        internal unsafe void AdoptDetached()
+        {
+            TrecsDebugAssert.That(!_isDisposed);
+            if (_detachLog->HasDetached == 0)
+            {
+                return;
+            }
+            using var _ = _adoptDetachedMarker.Auto();
+            new AdoptDetachedJob
+            {
+                Store = _store,
+                Log = _detachLog,
+                ChunkDirectory = (IntPtr*)_chunkDirectory.GetUnsafeReadOnlyPtr(),
+                ChunkCount =
+                    (_sideTableLength + NativeHeapResolver.ChunkSize - 1)
+                    >> NativeHeapResolver.ChunkSizeBits,
+                SparseToDense = (int*)_sparseToDense.GetUnsafeReadOnlyPtr(),
+                DensePayloads = (NativeHeapEntryPayload*)_densePayloads.GetUnsafePtr(),
+            }.Run();
+        }
+
+        [BurstCompile]
+        unsafe struct AdoptDetachedJob : IJob
+        {
+            public PageStore Store;
+
+            [NativeDisableUnsafePtrRestriction]
+            public NativeHeapDetachLog* Log;
+
+            [NativeDisableUnsafePtrRestriction]
+            public IntPtr* ChunkDirectory;
+            public int ChunkCount;
+
+            [NativeDisableUnsafePtrRestriction]
+            public int* SparseToDense;
+
+            [NativeDisableUnsafePtrRestriction]
+            public NativeHeapEntryPayload* DensePayloads;
+
+            public void Execute()
+            {
+                Log->HasDetached = 0;
+                var wordCount = (ChunkCount + 63) >> 6;
+                for (int w = 0; w < wordCount; w++)
+                {
+                    var chunkBits = Log->ChunkBits[w];
+                    Log->ChunkBits[w] = 0;
+                    while (chunkBits != 0)
+                    {
+                        var chunk = (w << 6) + math.tzcnt(chunkBits);
+                        chunkBits &= chunkBits - 1;
+                        var chunkBase = (NativeHeapEntry*)ChunkDirectory[chunk].ToPointer();
+                        var entryBits = (long*)(chunkBase + NativeHeapResolver.ChunkSize);
+                        for (int e = 0; e < NativeHeapResolver.ChunkSize / 64; e++)
+                        {
+                            var bits = entryBits[e];
+                            entryBits[e] = 0;
+                            while (bits != 0)
+                            {
+                                var inChunk = (e << 6) + math.tzcnt(bits);
+                                bits &= bits - 1;
+                                var slot = chunkBase + inChunk;
+                                // Freed, or already moved back by Reallocate since.
+                                if (slot->InUse == 0 || slot->IsDetached == 0)
+                                {
+                                    continue;
+                                }
+                                var idx = (chunk << NativeHeapResolver.ChunkSizeBits) + inChunk;
+                                var size = DetachedBlock.GetSize(slot->Address.ToPointer());
+                                MoveToNewSlot(
+                                    ref Store,
+                                    slot,
+                                    DensePayloads + SparseToDense[idx],
+                                    size,
+                                    DetachedBlock.MaxAlignment,
+                                    size
+                                );
+                            }
+                        }
+                    }
+                }
+                DetachedBlock.FreeArenaChunks(Log);
+            }
         }
 
         /// <summary>
@@ -529,7 +685,7 @@ namespace Trecs.Internal
         /// after the callback returns. Prefer a static method assigned to a static readonly
         /// field to avoid per-call GC allocation from closure capture.</para>
         /// </summary>
-        public void Free(PtrHandle handle)
+        public unsafe void Free(PtrHandle handle)
         {
             using var _ = _freeMarker.Auto();
             TrecsDebugAssert.That(!_isDisposed);
@@ -585,6 +741,7 @@ namespace Trecs.Internal
             _sparseToDense[idx] = -1;
 
             entry.InUse = 0;
+            entry.IsDetached = 0;
             entry.Address = IntPtr.Zero;
             SetEntry(idx, entry);
 
@@ -642,23 +799,13 @@ namespace Trecs.Internal
             TrecsDebugAssert.That(UnityThreadHelper.IsMainThread);
 
             int reclaimed = 0;
-            for (int pageId = 0; pageId < _pages.Length; pageId++)
+            for (int pageId = 0; pageId < _store.Pages.Length; pageId++)
             {
-                var page = _pages[pageId];
+                var page = _store.Pages[pageId];
                 if (page.Address == IntPtr.Zero || page.FreeCount != page.SlotCount)
                     continue;
 
-                // Strip this page out of its bucket's freelist before freeing it.
-                if (page.BucketIdx >= 0)
-                {
-                    var bucket = _buckets[page.BucketIdx];
-                    bucket.PageIds.Remove(pageId);
-                    RemovePageFromFreeSlots(bucket, pageId);
-                }
-
-                FreePage(in page);
-                _pages[pageId] = default;
-                _freePageIds.Push(pageId);
+                _store.ReclaimPage(pageId);
                 reclaimed++;
             }
             return reclaimed;
@@ -666,9 +813,12 @@ namespace Trecs.Internal
 
         internal bool SuppressDisposeWarnings { get; set; }
 
-        public void Dispose()
+        public unsafe void Dispose()
         {
             TrecsDebugAssert.That(!_isDisposed);
+
+            DetachedBlock.DisposeArenas(_detachLog);
+            UnsafeUtility.FreeTracked(_detachLog, Allocator.Persistent);
 
             // Any side-table slots still in use indicate leaked allocations. Render a
             // single grouped warning (type + call site + occurrence count), then release
@@ -690,17 +840,7 @@ namespace Trecs.Internal
             _callerInfoByHandle.Clear();
 #endif
 
-            // Free every page we still own.
-            for (int i = 0; i < _pages.Length; i++)
-            {
-                var page = _pages[i];
-                if (page.Address != IntPtr.Zero)
-                {
-                    FreePage(in page);
-                }
-            }
-            _pages.Clear();
-            _freePageIds.Clear();
+            _store.Dispose();
             _freeSideTableSlots.Clear();
 #if ENABLE_UNITY_COLLECTIONS_CHECKS
             _externalAddresses.Clear();
@@ -708,7 +848,6 @@ namespace Trecs.Internal
 
             DisposeAllChunks();
             _chunkDirectory.Dispose();
-            _pages.Dispose();
             _densePayloads.Dispose();
             _denseSlotIndices.Dispose();
             _sparseToDense.Dispose();
@@ -737,14 +876,14 @@ namespace Trecs.Internal
             var groups = new IterableDictionary<(int TypeHash, string File, int Line), int>();
             for (int n = 0; n < _densePayloads.Length; n++)
             {
-                var payload = _densePayloads[n];
                 var sideTableIdx = _denseSlotIndices[n];
+                var entry = GetEntry(sideTableIdx);
 
                 string callerFile = null;
                 int callerLine = 0;
 #if DEBUG
                 var handleValue = NativeHeapResolver.EncodeHandleValue(
-                    payload.Generation,
+                    entry.Generation,
                     (uint)sideTableIdx
                 );
                 if (_callerInfoByHandle.TryGetValue(handleValue, out var caller))
@@ -753,7 +892,7 @@ namespace Trecs.Internal
                     callerLine = caller.Line;
                 }
 #endif
-                var key = (payload.TypeHash, callerFile, callerLine);
+                var key = (entry.TypeHash, callerFile, callerLine);
                 groups.TryGetValue(key, out var count);
                 groups[key] = count + 1;
             }
@@ -776,7 +915,8 @@ namespace Trecs.Internal
 
         // ─── Serialization ───────────────────────────────────────
 
-        const int SerializationVersion = 4;
+        // Also covers the block layouts of the containers stored in it (TrecsList, TrecsDictionary).
+        const int SerializationVersion = 5;
 
         /// <summary>
         /// Bulk-dumps the chunk store's full state in a few wide blits. Replaces the
@@ -793,6 +933,7 @@ namespace Trecs.Internal
             using var _ = TrecsProfiling.Start("NativeHeap.Serialize");
             TrecsDebugAssert.That(!_isDisposed);
             TrecsDebugAssert.That(UnityThreadHelper.IsMainThread);
+            AdoptDetached();
 
             if (writer.HasFlag(SerializationFlags.DesyncFriendlyHeaps))
             {
@@ -806,7 +947,7 @@ namespace Trecs.Internal
                 LiveCount = _liveCount,
                 SideTableLength = _sideTableLength,
                 NextFreshSideTableSlot = _nextFreshSideTableSlot,
-                NumPages = _pages.Length,
+                NumPages = _store.Pages.Length,
             };
             writer.BlitWriteRawBytes(
                 "Header",
@@ -821,9 +962,9 @@ namespace Trecs.Internal
 
             using (TrecsProfiling.Start("Writing pages"))
             {
-                for (int pageId = 0; pageId < _pages.Length; pageId++)
+                for (int pageId = 0; pageId < _store.Pages.Length; pageId++)
                 {
-                    var page = _pages[pageId];
+                    var page = _store.Pages[pageId];
                     if (page.Address == IntPtr.Zero)
                     {
                         var nullHeader = new SerializedPageHeader { Kind = (byte)PageKind.Null };
@@ -864,7 +1005,7 @@ namespace Trecs.Internal
 
             _log.Trace(
                 "Chunk store serialized: pages={0} liveEntries={1} sideTableLength={2}",
-                _pages.Length,
+                _store.Pages.Length,
                 _liveCount,
                 _sideTableLength
             );
@@ -872,13 +1013,12 @@ namespace Trecs.Internal
 
         unsafe void ZeroFreeSlots()
         {
-            for (int b = 0; b < _buckets.Length; b++)
+            for (int b = 0; b < BucketCount; b++)
             {
-                var bucket = _buckets[b];
-                foreach (var (pageId, slotIdx) in bucket.FreeSlots)
+                foreach (var free in _store.Buckets[b].FreeSlots)
                 {
-                    var page = _pages[pageId];
-                    var addr = (byte*)page.Address.ToPointer() + slotIdx * page.SlotSize;
+                    var page = _store.Pages[free.x];
+                    var addr = (byte*)page.Address.ToPointer() + free.y * page.SlotSize;
                     UnsafeUtility.MemClear(addr, page.SlotSize);
                 }
             }
@@ -895,13 +1035,14 @@ namespace Trecs.Internal
             {
                 var payload = _densePayloads[n];
                 var sideTableIdx = _denseSlotIndices[n];
-                var page = _pages[payload.PageId];
+                var entry = GetEntry(sideTableIdx);
+                var page = _store.Pages[payload.PageId];
                 var slotSize = page.SlotSize;
                 var slotAddr = (byte*)page.Address.ToPointer() + payload.SlotIndex * slotSize;
 
                 string scopeName = null;
 #if DEBUG
-                uint handleValue = (uint)payload.Generation << 24 | (uint)sideTableIdx;
+                uint handleValue = (uint)entry.Generation << 24 | (uint)sideTableIdx;
                 if (_callerInfoByHandle.TryGetValue(handleValue, out var caller))
                 {
                     var fileName = Path.GetFileNameWithoutExtension(caller.File);
@@ -911,15 +1052,15 @@ namespace Trecs.Internal
                 if (scopeName == null)
                 {
                     var typeName = TypeIdReverseLookup.TryGetTypeFromId(
-                        new TypeId(payload.TypeHash),
+                        new TypeId(entry.TypeHash),
                         out var type
                     )
                         ? type.GetPrettyName()
-                        : $"Type{payload.TypeHash}";
+                        : $"Type{entry.TypeHash}";
                     scopeName = $"Slot{sideTableIdx}_{typeName}";
                 }
                 writer.PushScope(scopeName);
-                writer.Write<int>("TypeHash", payload.TypeHash);
+                writer.Write<int>("TypeHash", entry.TypeHash);
                 writer.Write<int>("Size", slotSize);
                 writer.BlitWriteRawBytes("Data", slotAddr, slotSize);
                 writer.PopScope();
@@ -937,6 +1078,8 @@ namespace Trecs.Internal
             using var _ = TrecsProfiling.Start("NativeHeap.Deserialize");
             TrecsDebugAssert.That(!_isDisposed);
             TrecsDebugAssert.That(UnityThreadHelper.IsMainThread);
+            // Clears the detach bits; the reset below then frees the adopted slots with the rest.
+            AdoptDetached();
             // No "live count must be 0" pre-assert: ResetForDeserialize below wipes
             // everything (pages, side-table generations, bucket bookkeeping, live count).
             // Persistent NativeUniquePtr / TrecsList allocations live entirely here, so
@@ -1002,7 +1145,7 @@ namespace Trecs.Internal
                     var kind = (PageKind)pageHeader.Kind;
                     if (kind == PageKind.Null)
                     {
-                        _pages.Add(default);
+                        _store.Pages.Add(default);
                         continue;
                     }
 
@@ -1013,9 +1156,8 @@ namespace Trecs.Internal
                     var bucketIdx = pageHeader.BucketIdx;
 
                     var pageBytes = bucketIdx >= 0 ? slotSize * slotCount : slotSize;
-                    // Match the size/items convention used by AllocateNewPageForBucket and
-                    // AllocHugePage: pass total bytes as `size`, items=1. FreePage uses the
-                    // same convention symmetrically.
+                    // Total bytes as `size`, items=1: the convention PageStore allocates and
+                    // frees pages with.
                     var pagePtr = AllocatorManager.Allocate(
                         Allocator.Persistent,
                         pageBytes,
@@ -1039,10 +1181,10 @@ namespace Trecs.Internal
                         FreeCount = freeCount,
                         Alignment = alignment,
                     };
-                    _pages.Add(page);
+                    _store.Pages.Add(page);
                     if (bucketIdx >= 0)
                     {
-                        _buckets[bucketIdx].PageIds.Add(pageId);
+                        _store.Buckets[bucketIdx].PageIds.Add(pageId);
                     }
                 }
             }
@@ -1072,6 +1214,22 @@ namespace Trecs.Internal
                     _densePayloads.GetUnsafePtr(),
                     numLiveEntries * UnsafeUtility.SizeOf<NativeHeapEntryPayload>()
                 );
+                var typeHashes = new NativeArray<int>(
+                    numLiveEntries,
+                    Allocator.TempJob,
+                    NativeArrayOptions.UninitializedMemory
+                );
+                var generations = new NativeArray<byte>(
+                    numLiveEntries,
+                    Allocator.TempJob,
+                    NativeArrayOptions.UninitializedMemory
+                );
+                reader.BlitReadRawBytes(
+                    "TypeHashes",
+                    typeHashes.GetUnsafePtr(),
+                    numLiveEntries * sizeof(int)
+                );
+                reader.BlitReadRawBytes("Generations", generations.GetUnsafePtr(), numLiveEntries);
 
                 // Grow _sparseToDense to cover the full side-table range, filled with -1.
                 if (_sparseToDense.Length < sideTableLength)
@@ -1090,12 +1248,16 @@ namespace Trecs.Internal
                 {
                     DenseSlotIndices = _denseSlotIndices,
                     DensePayloads = _densePayloads,
-                    Pages = _pages,
+                    TypeHashes = typeHashes,
+                    Generations = generations,
+                    Pages = _store.Pages,
                     ChunkDirectory = _chunkDirectory,
                     SparseToDense = _sparseToDense,
                 }
                     .Schedule(numLiveEntries, JobsUtil.ChooseBatchSize(numLiveEntries))
                     .Complete();
+                typeHashes.Dispose();
+                generations.Dispose();
 
 #if ENABLE_UNITY_COLLECTIONS_CHECKS
                 for (int n = 0; n < numLiveEntries; n++)
@@ -1128,14 +1290,14 @@ namespace Trecs.Internal
             using (TrecsProfiling.Start("Reading free-slot stacks"))
             {
                 ReadSideTableFreeSlots(reader);
-                ReadStack(reader, "freePageIds", _freePageIds);
+                ReadStack(reader, "freePageIds", ref _store.FreePageIds);
             }
 
             using (TrecsProfiling.Start("Reading bucket free-slots"))
             {
-                for (int b = 0; b < _buckets.Length; b++)
+                for (int b = 0; b < BucketCount; b++)
                 {
-                    var bucket = _buckets[b];
+                    ref var bucket = ref _store.Buckets[b];
                     int count;
                     reader.BlitReadRawBytes("BucketFreeSlotsCount", &count, sizeof(int));
                     var pageIds = new NativeArray<int>(count, Allocator.Temp);
@@ -1152,7 +1314,7 @@ namespace Trecs.Internal
                     );
                     // Data is top-to-bottom; push in reverse so top ends up on top.
                     for (int j = count - 1; j >= 0; j--)
-                        bucket.FreeSlots.Push((pageIds[j], slotIdxs[j]));
+                        bucket.FreeSlots.Add(new int2(pageIds[j], slotIdxs[j]));
                     pageIds.Dispose();
                     slotIdxs.Dispose();
                 }
@@ -1163,7 +1325,7 @@ namespace Trecs.Internal
 
             _log.Debug(
                 "Chunk store deserialized: pages={0} liveEntries={1} sideTableLength={2}",
-                _pages.Length,
+                _store.Pages.Length,
                 _liveCount,
                 _sideTableLength
             );
@@ -1208,16 +1370,7 @@ namespace Trecs.Internal
             {
                 // Free pages we still own. With stateless heaps, this also reclaims pages
                 // for any handles that weren't explicitly disposed before the snapshot load.
-                for (int i = 0; i < _pages.Length; i++)
-                {
-                    var page = _pages[i];
-                    if (page.Address != IntPtr.Zero)
-                    {
-                        FreePage(in page);
-                    }
-                }
-                _pages.Clear();
-                _freePageIds.Clear();
+                _store.Clear();
                 _freeSideTableSlots.Clear();
 #if ENABLE_UNITY_COLLECTIONS_CHECKS
                 _externalAddresses.Clear();
@@ -1264,13 +1417,6 @@ namespace Trecs.Internal
                 }
             }
 
-            // Reset bucket bookkeeping.
-            for (int b = 0; b < _buckets.Length; b++)
-            {
-                _buckets[b].PageIds.Clear();
-                _buckets[b].FreeSlots.Clear();
-            }
-
             _densePayloads.Clear();
             _denseSlotIndices.Clear();
             _sparseToDense.Clear();
@@ -1309,14 +1455,18 @@ namespace Trecs.Internal
             public int BucketIdx;
         }
 
-        static unsafe void WriteStack(ISerializationWriter writer, string name, Stack<int> stack)
+        // A list used as a stack (top last) goes on the wire top first.
+        static unsafe void WriteStack(
+            ISerializationWriter writer,
+            string name,
+            NativeList<int> stack
+        )
         {
-            var count = stack.Count;
+            var count = stack.Length;
             writer.BlitWriteRawBytes(name + "Count", &count, sizeof(int));
             var arr = new NativeArray<int>(count, Allocator.Temp);
-            int idx = 0;
-            foreach (var item in stack)
-                arr[idx++] = item;
+            for (int i = 0; i < count; i++)
+                arr[i] = stack[count - 1 - i];
             writer.BlitWriteRawBytes(
                 name,
                 NativeArrayUnsafeUtility.GetUnsafeReadOnlyPtr(arr),
@@ -1325,7 +1475,11 @@ namespace Trecs.Internal
             arr.Dispose();
         }
 
-        static unsafe void ReadStack(ISerializationReader reader, string name, Stack<int> stack)
+        static unsafe void ReadStack(
+            ISerializationReader reader,
+            string name,
+            ref NativeList<int> stack
+        )
         {
             int count;
             reader.BlitReadRawBytes(name + "Count", &count, sizeof(int));
@@ -1337,7 +1491,7 @@ namespace Trecs.Internal
             );
             // Data is top-to-bottom; push in reverse so top ends up on top.
             for (int i = count - 1; i >= 0; i--)
-                stack.Push(arr[i]);
+                stack.Add(arr[i]);
             arr.Dispose();
         }
 
@@ -1363,15 +1517,39 @@ namespace Trecs.Internal
                 _densePayloads.GetUnsafeReadOnlyPtr(),
                 _liveCount * UnsafeUtility.SizeOf<NativeHeapEntryPayload>()
             );
+            var typeHashes = new NativeArray<int>(
+                _liveCount,
+                Allocator.Temp,
+                NativeArrayOptions.UninitializedMemory
+            );
+            var generations = new NativeArray<byte>(
+                _liveCount,
+                Allocator.Temp,
+                NativeArrayOptions.UninitializedMemory
+            );
+            for (int n = 0; n < _liveCount; n++)
+            {
+                var entry = GetEntryPtr(_denseSlotIndices[n]);
+                typeHashes[n] = entry->TypeHash;
+                generations[n] = entry->Generation;
+            }
+            writer.BlitWriteRawBytes(
+                "TypeHashes",
+                typeHashes.GetUnsafeReadOnlyPtr(),
+                _liveCount * sizeof(int)
+            );
+            writer.BlitWriteRawBytes("Generations", generations.GetUnsafeReadOnlyPtr(), _liveCount);
+            typeHashes.Dispose();
+            generations.Dispose();
 
             WriteSideTableFreeSlots(writer);
-            WriteStack(writer, "freePageIds", _freePageIds);
+            WriteStack(writer, "freePageIds", _store.FreePageIds);
 
             // Batch all bucket free-slot pairs into two contiguous arrays
             // to minimize NativeArray allocations (was 2 per bucket = 26 allocs).
             int totalBucketFreeSlots = 0;
-            for (int b = 0; b < _buckets.Length; b++)
-                totalBucketFreeSlots += _buckets[b].FreeSlots.Count;
+            for (int b = 0; b < BucketCount; b++)
+                totalBucketFreeSlots += _store.Buckets[b].FreeSlots.Length;
 
             var allBucketPageIds = new NativeArray<int>(totalBucketFreeSlots, Allocator.Temp);
             var allBucketSlotIdxs = new NativeArray<int>(totalBucketFreeSlots, Allocator.Temp);
@@ -1380,15 +1558,16 @@ namespace Trecs.Internal
                 NativeArrayUnsafeUtility.GetUnsafePtr(allBucketSlotIdxs);
             int offset = 0;
 
-            for (int b = 0; b < _buckets.Length; b++)
+            for (int b = 0; b < BucketCount; b++)
             {
-                var bucket = _buckets[b];
-                var count = bucket.FreeSlots.Count;
+                var freeSlots = _store.Buckets[b].FreeSlots;
+                var count = freeSlots.Length;
                 writer.BlitWriteRawBytes("BucketFreeSlotsCount", &count, sizeof(int));
-                foreach (var (pageId, slotIdx) in bucket.FreeSlots)
+                // Top of the stack first.
+                for (int i = count - 1; i >= 0; i--)
                 {
-                    allBucketPageIdsPtr[offset] = pageId;
-                    allBucketSlotIdxsPtr[offset] = slotIdx;
+                    allBucketPageIdsPtr[offset] = freeSlots[i].x;
+                    allBucketSlotIdxsPtr[offset] = freeSlots[i].y;
                     offset++;
                 }
                 writer.BlitWriteRawBytes(
@@ -1477,135 +1656,6 @@ namespace Trecs.Internal
 
         // ─── Internal mechanics ──────────────────────────────────
 
-        static int SelectBucket(int slotSize)
-        {
-            // Tiny linear scan over 13 entries — branch-predictor friendly, no log2 instruction
-            // needed. Replace if profiling shows the cost.
-            for (int i = 0; i < BucketSlotSizes.Length; i++)
-            {
-                if (BucketSlotSizes[i] >= slotSize)
-                    return i;
-            }
-            throw TrecsDebugAssert.CreateException(
-                "Allocation size {0} exceeds max bucket size {1}",
-                slotSize,
-                MaxBucketSlotSize
-            );
-        }
-
-        unsafe void AllocFromBucket(
-            int bucketIdx,
-            out int pageId,
-            out int slotIdx,
-            out IntPtr address
-        )
-        {
-            var bucket = _buckets[bucketIdx];
-
-            if (bucket.FreeSlots.Count == 0)
-            {
-                AllocateNewPageForBucket(bucketIdx);
-            }
-
-            var (pId, sIdx) = bucket.FreeSlots.Pop();
-            var page = _pages[pId];
-            TrecsDebugAssert.That(
-                page.Address != IntPtr.Zero,
-                "Free slot pointed at reclaimed page {0}",
-                pId
-            );
-            TrecsDebugAssert.That(page.FreeCount > 0);
-            page.FreeCount--;
-            _pages[pId] = page;
-
-            pageId = pId;
-            slotIdx = sIdx;
-            address = new IntPtr((byte*)page.Address.ToPointer() + sIdx * page.SlotSize);
-        }
-
-        unsafe void AllocateNewPageForBucket(int bucketIdx)
-        {
-            var bucket = _buckets[bucketIdx];
-            var pagePtr = AllocatorManager.Allocate(
-                Allocator.Persistent,
-                bucket.PageSizeBytes,
-                bucket.SlotSize,
-                items: 1
-            );
-            TrecsDebugAssert.That(
-                pagePtr != null,
-                "AllocatorManager returned null page (size {0}, align {1})",
-                bucket.PageSizeBytes,
-                bucket.SlotSize
-            );
-
-            var page = new Page
-            {
-                Address = new IntPtr(pagePtr),
-                BucketIdx = bucketIdx,
-                SlotSize = bucket.SlotSize,
-                SlotCount = bucket.SlotsPerPage,
-                FreeCount = bucket.SlotsPerPage,
-                Alignment = bucket.SlotSize,
-            };
-
-            int pageId = AcquirePageId(page);
-            bucket.PageIds.Add(pageId);
-
-            // Seed the bucket freelist with every slot in the new page. Push in reverse so
-            // pops come out in ascending slot order — gives newly-grown buckets a more
-            // predictable layout for the next batch of allocations.
-            for (int s = bucket.SlotsPerPage - 1; s >= 0; s--)
-            {
-                bucket.FreeSlots.Push((pageId, s));
-            }
-
-            _log.Trace(
-                "Allocated bucket page: bucket={0} slotSize={1} slots={2} pageId={3}",
-                bucketIdx,
-                bucket.SlotSize,
-                bucket.SlotsPerPage,
-                pageId
-            );
-        }
-
-        unsafe void AllocHugePage(
-            int size,
-            int alignment,
-            out int pageId,
-            out int slotIdx,
-            out IntPtr address
-        )
-        {
-            var pagePtr = AllocatorManager.Allocate(
-                Allocator.Persistent,
-                size,
-                alignment,
-                items: 1
-            );
-            TrecsDebugAssert.That(
-                pagePtr != null,
-                "AllocatorManager returned null huge page (size {0})",
-                size
-            );
-
-            var page = new Page
-            {
-                Address = new IntPtr(pagePtr),
-                BucketIdx = -1,
-                SlotSize = size,
-                SlotCount = 1,
-                FreeCount = 0, // immediately occupied
-                Alignment = alignment,
-            };
-
-            pageId = AcquirePageId(page);
-            slotIdx = 0;
-            address = page.Address;
-
-            _log.Trace("Allocated huge page: size={0} pageId={1}", size, pageId);
-        }
-
         /// <summary>
         /// Registers an externally-allocated pointer as a single-slot page owned by this
         /// chunk store. The pointer must have been allocated via <c>AllocatorManager.Allocate</c>
@@ -1655,7 +1705,7 @@ namespace Trecs.Internal
                 FreeCount = 0,
                 Alignment = alignment,
             };
-            var pageId = AcquirePageId(page);
+            var pageId = _store.AcquirePageId(page);
 
             var sideTableIdx = AcquireSideTableSlot();
             var prior = GetEntry(sideTableIdx);
@@ -1688,16 +1738,7 @@ namespace Trecs.Internal
             _sparseToDense[sideTableIdx] = _densePayloads.Length;
             _denseSlotIndices.Add(sideTableIdx);
             _densePayloads.Add(
-                new NativeHeapEntryPayload
-                {
-                    TypeHash = typeHash,
-                    Generation = nextGen,
-                    InUse = 1,
-                    OwnsWholePage = 1,
-                    _padding = 0,
-                    PageId = pageId,
-                    SlotIndex = 0,
-                }
+                new NativeHeapEntryPayload { PageId = pageId, OwnsWholePage = 1 }
             );
 
 #if DEBUG
@@ -1710,67 +1751,16 @@ namespace Trecs.Internal
             return new PtrHandle(handleValue);
         }
 
-        int AcquirePageId(Page page)
-        {
-            if (_freePageIds.Count > 0)
-            {
-                var pageId = _freePageIds.Pop();
-                _pages[pageId] = page;
-                return pageId;
-            }
-            _pages.Add(page);
-            return _pages.Length - 1;
-        }
-
         void ReturnSlot(int pageId, int slotIdx, bool ownsWholePage)
         {
-            var page = _pages[pageId];
-            TrecsDebugAssert.That(
-                page.Address != IntPtr.Zero,
-                "ReturnSlot: page {0} already reclaimed",
-                pageId
-            );
-
+#if ENABLE_UNITY_COLLECTIONS_CHECKS
+            // An external page may be registered again once released.
             if (ownsWholePage)
             {
-#if ENABLE_UNITY_COLLECTIONS_CHECKS
-                // If this was an external page (registered via AllocExternal), drop it
-                // from the tracking set so the address can be re-registered later. The
-                // Remove is silent on miss — most huge pages aren't external.
-                _externalAddresses.Remove(page.Address);
-#endif
-                FreePage(in page);
-                _pages[pageId] = default;
-                _freePageIds.Push(pageId);
-                return;
+                _externalAddresses.Remove(_store.Pages[pageId].Address);
             }
-
-            page.FreeCount++;
-            TrecsDebugAssert.That(
-                page.FreeCount <= page.SlotCount,
-                "Page {0} free-count overflow ({1} > {2})",
-                pageId,
-                page.FreeCount,
-                page.SlotCount
-            );
-            _pages[pageId] = page;
-
-            var bucket = _buckets[page.BucketIdx];
-            bucket.FreeSlots.Push((pageId, slotIdx));
-        }
-
-        unsafe void FreePage(in Page page)
-        {
-            // Total bytes to free differs between bucket pages (slotSize × slotCount) and
-            // single-slot huge/external pages (the slot is the page).
-            var sizeOf = page.BucketIdx >= 0 ? page.SlotSize * page.SlotCount : page.SlotSize;
-            AllocatorManager.Free(
-                Allocator.Persistent,
-                page.Address.ToPointer(),
-                sizeOf,
-                page.Alignment,
-                items: 1
-            );
+#endif
+            _store.ReturnSlot(pageId, slotIdx, ownsWholePage);
         }
 
         int AcquireSideTableSlot()
@@ -1832,20 +1822,19 @@ namespace Trecs.Internal
                 chunkIdx
             );
 
-            var entrySize = UnsafeUtility.SizeOf<NativeHeapEntry>();
-            var entryAlign = UnsafeUtility.AlignOf<NativeHeapEntry>();
+            var chunkBytes = NativeHeapResolver.ChunkByteSize;
             var ptr = AllocatorManager.Allocate(
                 Allocator.Persistent,
-                entrySize,
-                entryAlign,
-                items: NativeHeapResolver.ChunkSize
+                chunkBytes,
+                UnsafeUtility.AlignOf<NativeHeapEntry>(),
+                items: 1
             );
             TrecsDebugAssert.That(
                 ptr != null,
                 "AllocateChunk: AllocatorManager returned null for chunk {0}",
                 chunkIdx
             );
-            UnsafeUtility.MemClear(ptr, (long)entrySize * NativeHeapResolver.ChunkSize);
+            UnsafeUtility.MemClear(ptr, chunkBytes);
             // Defense-in-depth: any handle obtained via a normal Alloc → Schedule path
             // already sees the zero-init because Unity's job-system Schedule() fences
             // main-thread writes before the worker runs. The barrier here covers the
@@ -1856,6 +1845,19 @@ namespace Trecs.Internal
             // pass InUse=1/Generation checks. Also serves as a compiler fence on x64.
             Thread.MemoryBarrier();
             _chunkDirectory[chunkIdx] = new IntPtr(ptr);
+        }
+
+        unsafe NativeHeapEntry* GetEntryPtr(int idx)
+        {
+            TrecsDebugAssert.That(
+                idx >= 0 && idx < _sideTableLength,
+                "GetEntryPtr: idx {0} out of range (length {1})",
+                idx,
+                _sideTableLength
+            );
+            var chunkPtr = (NativeHeapEntry*)
+                _chunkDirectory[idx >> NativeHeapResolver.ChunkSizeBits].ToPointer();
+            return chunkPtr + (idx & NativeHeapResolver.ChunkIndexMask);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -1888,8 +1890,6 @@ namespace Trecs.Internal
 
         unsafe void DisposeAllChunks()
         {
-            var entrySize = UnsafeUtility.SizeOf<NativeHeapEntry>();
-            var entryAlign = UnsafeUtility.AlignOf<NativeHeapEntry>();
             for (int i = 0; i < _chunkDirectory.Length; i++)
             {
                 var ptr = _chunkDirectory[i];
@@ -1900,45 +1900,25 @@ namespace Trecs.Internal
                 AllocatorManager.Free(
                     Allocator.Persistent,
                     ptr.ToPointer(),
-                    entrySize,
-                    entryAlign,
-                    items: NativeHeapResolver.ChunkSize
+                    NativeHeapResolver.ChunkByteSize,
+                    UnsafeUtility.AlignOf<NativeHeapEntry>(),
+                    items: 1
                 );
                 _chunkDirectory[i] = IntPtr.Zero;
             }
         }
 
-        static void RemovePageFromFreeSlots(Bucket bucket, int pageId)
-        {
-            // Rebuild the freelist without entries for the reclaimed page. Stack ordering
-            // is preserved relative to the survivors.
-            if (bucket.FreeSlots.Count == 0)
-                return;
-            var survivors = new List<(int PageId, int SlotIdx)>(bucket.FreeSlots.Count);
-            foreach (var entry in bucket.FreeSlots)
-            {
-                if (entry.PageId != pageId)
-                {
-                    survivors.Add(entry);
-                }
-            }
-            bucket.FreeSlots.Clear();
-            // Push in reverse so iteration order over survivors is preserved.
-            for (int i = survivors.Count - 1; i >= 0; i--)
-            {
-                bucket.FreeSlots.Push(survivors[i]);
-            }
-        }
-
         // ─── Inner types ─────────────────────────────────────────
 
-        sealed class Bucket
+        struct Bucket
         {
             public int SlotSize;
             public int SlotsPerPage;
             public int PageSizeBytes;
-            public readonly List<int> PageIds = new();
-            public readonly Stack<(int PageId, int SlotIdx)> FreeSlots = new();
+            public UnsafeList<int> PageIds;
+
+            // Stack: top is last.
+            public UnsafeList<int2> FreeSlots;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -1952,6 +1932,269 @@ namespace Trecs.Internal
             public int Alignment;
         }
 
+        /// <summary>
+        /// Pages and their free slots. Plain shared containers, so a copy works on the same
+        /// state: the managed paths and the Burst adoption job run this one code.
+        /// </summary>
+        unsafe struct PageStore
+        {
+            public NativeList<Page> Pages;
+
+            // Stack: top is last.
+            public NativeList<int> FreePageIds;
+
+            [NativeDisableUnsafePtrRestriction]
+            public Bucket* Buckets;
+
+            public static PageStore Create()
+            {
+                var store = new PageStore
+                {
+                    Pages = new NativeList<Page>(64, Allocator.Persistent),
+                    FreePageIds = new NativeList<int>(16, Allocator.Persistent),
+                    Buckets = (Bucket*)
+                        UnsafeUtility.MallocTracked(
+                            sizeof(Bucket) * BucketCount,
+                            UnsafeUtility.AlignOf<Bucket>(),
+                            Allocator.Persistent,
+                            0
+                        ),
+                };
+                for (int i = 0; i < BucketCount; i++)
+                {
+                    var slotSize = MinBucketSlotSize << i;
+                    var pageSize = Math.Max(MinPageSize, slotSize * TargetSlotsPerPage);
+                    store.Buckets[i] = new Bucket
+                    {
+                        SlotSize = slotSize,
+                        SlotsPerPage = pageSize / slotSize,
+                        PageSizeBytes = pageSize,
+                        PageIds = new UnsafeList<int>(8, Allocator.Persistent),
+                        FreeSlots = new UnsafeList<int2>(64, Allocator.Persistent),
+                    };
+                }
+                return store;
+            }
+
+            /// <summary>Frees every page and forgets every slot.</summary>
+            public void Clear()
+            {
+                for (int i = 0; i < Pages.Length; i++)
+                {
+                    var page = Pages[i];
+                    if (page.Address != IntPtr.Zero)
+                    {
+                        FreePage(in page);
+                    }
+                }
+                Pages.Clear();
+                FreePageIds.Clear();
+                for (int b = 0; b < BucketCount; b++)
+                {
+                    Buckets[b].PageIds.Clear();
+                    Buckets[b].FreeSlots.Clear();
+                }
+            }
+
+            public void Dispose()
+            {
+                Clear();
+                for (int b = 0; b < BucketCount; b++)
+                {
+                    Buckets[b].PageIds.Dispose();
+                    Buckets[b].FreeSlots.Dispose();
+                }
+                UnsafeUtility.FreeTracked(Buckets, Allocator.Persistent);
+                Pages.Dispose();
+                FreePageIds.Dispose();
+            }
+
+            public void AllocSlot(
+                int size,
+                int alignment,
+                out int pageId,
+                out int slotIdx,
+                out int bucketIdx,
+                out bool ownsWholePage,
+                out int slotByteSize,
+                out IntPtr address
+            )
+            {
+                var neededSlotSize = Math.Max(size, alignment);
+                if (neededSlotSize > MaxBucketSlotSize)
+                {
+                    var pagePtr = AllocatorManager.Allocate(
+                        Allocator.Persistent,
+                        neededSlotSize,
+                        alignment,
+                        items: 1
+                    );
+                    TrecsDebugAssert.That(
+                        pagePtr != null,
+                        "AllocatorManager returned null huge page (size {0})",
+                        neededSlotSize
+                    );
+                    address = new IntPtr(pagePtr);
+                    pageId = AcquirePageId(
+                        new Page
+                        {
+                            Address = address,
+                            BucketIdx = -1,
+                            SlotSize = neededSlotSize,
+                            SlotCount = 1,
+                            FreeCount = 0,
+                            Alignment = alignment,
+                        }
+                    );
+                    slotIdx = 0;
+                    bucketIdx = -1;
+                    ownsWholePage = true;
+                    slotByteSize = neededSlotSize;
+                    return;
+                }
+
+                bucketIdx = math.max(0, math.ceillog2(neededSlotSize) - math.tzcnt(MinBucketSlotSize));
+                ref var bucket = ref Buckets[bucketIdx];
+                if (bucket.FreeSlots.Length == 0)
+                {
+                    AddPage(bucketIdx);
+                }
+                var top = bucket.FreeSlots.Length - 1;
+                var free = bucket.FreeSlots[top];
+                bucket.FreeSlots.Length = top;
+
+                var page = Pages[free.x];
+                TrecsDebugAssert.That(
+                    page.Address != IntPtr.Zero && page.FreeCount > 0,
+                    "Free slot pointed at reclaimed or full page {0}",
+                    free.x
+                );
+                page.FreeCount--;
+                Pages[free.x] = page;
+
+                pageId = free.x;
+                slotIdx = free.y;
+                ownsWholePage = false;
+                slotByteSize = bucket.SlotSize;
+                address = new IntPtr((byte*)page.Address.ToPointer() + free.y * page.SlotSize);
+            }
+
+            void AddPage(int bucketIdx)
+            {
+                ref var bucket = ref Buckets[bucketIdx];
+                var pagePtr = AllocatorManager.Allocate(
+                    Allocator.Persistent,
+                    bucket.PageSizeBytes,
+                    bucket.SlotSize,
+                    items: 1
+                );
+                TrecsDebugAssert.That(
+                    pagePtr != null,
+                    "AllocatorManager returned null page (size {0}, align {1})",
+                    bucket.PageSizeBytes,
+                    bucket.SlotSize
+                );
+                var pageId = AcquirePageId(
+                    new Page
+                    {
+                        Address = new IntPtr(pagePtr),
+                        BucketIdx = bucketIdx,
+                        SlotSize = bucket.SlotSize,
+                        SlotCount = bucket.SlotsPerPage,
+                        FreeCount = bucket.SlotsPerPage,
+                        Alignment = bucket.SlotSize,
+                    }
+                );
+                bucket.PageIds.Add(pageId);
+                // Reverse, so pops come out in ascending slot order.
+                for (int s = bucket.SlotsPerPage - 1; s >= 0; s--)
+                {
+                    bucket.FreeSlots.Add(new int2(pageId, s));
+                }
+            }
+
+            public int AcquirePageId(Page page)
+            {
+                var freeCount = FreePageIds.Length;
+                if (freeCount > 0)
+                {
+                    var pageId = FreePageIds[freeCount - 1];
+                    FreePageIds.Length = freeCount - 1;
+                    Pages[pageId] = page;
+                    return pageId;
+                }
+                Pages.Add(page);
+                return Pages.Length - 1;
+            }
+
+            public void ReturnSlot(int pageId, int slotIdx, bool ownsWholePage)
+            {
+                var page = Pages[pageId];
+                TrecsDebugAssert.That(
+                    page.Address != IntPtr.Zero,
+                    "ReturnSlot: page {0} already reclaimed",
+                    pageId
+                );
+
+                if (ownsWholePage)
+                {
+                    FreePage(in page);
+                    Pages[pageId] = default;
+                    FreePageIds.Add(pageId);
+                    return;
+                }
+
+                page.FreeCount++;
+                TrecsDebugAssert.That(
+                    page.FreeCount <= page.SlotCount,
+                    "Page {0} free-count overflow ({1} > {2})",
+                    pageId,
+                    page.FreeCount,
+                    page.SlotCount
+                );
+                Pages[pageId] = page;
+                Buckets[page.BucketIdx].FreeSlots.Add(new int2(pageId, slotIdx));
+            }
+
+            /// <summary>Frees an empty page; its free slots leave the bucket in order.</summary>
+            public void ReclaimPage(int pageId)
+            {
+                var page = Pages[pageId];
+                if (page.BucketIdx >= 0)
+                {
+                    ref var bucket = ref Buckets[page.BucketIdx];
+                    var pageIdIndex = bucket.PageIds.IndexOf(pageId);
+                    bucket.PageIds.RemoveAt(pageIdIndex);
+
+                    var kept = 0;
+                    for (int i = 0; i < bucket.FreeSlots.Length; i++)
+                    {
+                        var free = bucket.FreeSlots[i];
+                        if (free.x != pageId)
+                        {
+                            bucket.FreeSlots[kept++] = free;
+                        }
+                    }
+                    bucket.FreeSlots.Length = kept;
+                }
+                FreePage(in page);
+                Pages[pageId] = default;
+                FreePageIds.Add(pageId);
+            }
+
+            static void FreePage(in Page page)
+            {
+                var sizeOf = page.BucketIdx >= 0 ? page.SlotSize * page.SlotCount : page.SlotSize;
+                AllocatorManager.Free(
+                    Allocator.Persistent,
+                    page.Address.ToPointer(),
+                    sizeOf,
+                    page.Alignment,
+                    items: 1
+                );
+            }
+        }
+
         [BurstCompile]
         unsafe struct DeserializeSideTableJob : IJobParallelFor
         {
@@ -1960,6 +2203,12 @@ namespace Trecs.Internal
 
             [ReadOnly]
             public NativeList<NativeHeapEntryPayload> DensePayloads;
+
+            [ReadOnly]
+            public NativeArray<int> TypeHashes;
+
+            [ReadOnly]
+            public NativeArray<byte> Generations;
 
             [ReadOnly]
             public NativeList<Page> Pages;
@@ -1985,9 +2234,9 @@ namespace Trecs.Internal
                 var entry = new NativeHeapEntry
                 {
                     Address = address,
-                    TypeHash = payload.TypeHash,
-                    Generation = payload.Generation,
-                    InUse = payload.InUse,
+                    TypeHash = TypeHashes[n],
+                    Generation = Generations[n],
+                    InUse = 1,
                 };
 
                 var chunkIdx = slotIdx >> NativeHeapResolver.ChunkSizeBits;

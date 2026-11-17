@@ -300,10 +300,6 @@ namespace Trecs.Tests
         [Test]
         public void Snapshot_PreservesEmptyTrecsList()
         {
-            // Capacity=0 lists have header->DataHandle == null and header->Data ==
-            // IntPtr.Zero. The Deserialize path must handle that without trying to
-            // resolve the null DataHandle, and the restored list must read back as
-            // an empty list (not throw, not allocate a buffer).
             using var env = EcsTestHelper.CreateEnvironment(TestTemplates.SimpleAlpha);
             var a = env.Accessor;
 
@@ -328,10 +324,7 @@ namespace Trecs.Tests
             var restored = new TrecsList<int>(savedHandle);
             var read = restored.Read(a);
             NAssert.AreEqual(0, read.Count);
-            NAssert.AreEqual(0, read.Capacity);
 
-            // Sanity: a follow-up EnsureCapacity + Add still works against the restored
-            // empty list (no stale data pointer hangover).
             restored.EnsureCapacity(a, 4);
             restored.Write(a).Add(99);
             NAssert.AreEqual(99, restored.Read(a)[0]);

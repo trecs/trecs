@@ -33,7 +33,7 @@ namespace Trecs.Tests
             NAssert.IsFalse(list.IsNull);
             var read = list.Read(chunkStore.Resolver);
             NAssert.AreEqual(0, read.Count);
-            NAssert.AreEqual(0, read.Capacity);
+            NAssert.AreEqual(2, read.Capacity, "16-byte slot: 8-byte header, two ints");
 
             list.Dispose(chunkStore);
             chunkStore.Dispose();
@@ -47,7 +47,7 @@ namespace Trecs.Tests
 
             var read = list.Read(chunkStore.Resolver);
             NAssert.AreEqual(0, read.Count);
-            NAssert.AreEqual(16, read.Capacity);
+            NAssert.GreaterOrEqual(read.Capacity, 16);
 
             list.Dispose(chunkStore);
             chunkStore.Dispose();
@@ -102,7 +102,6 @@ namespace Trecs.Tests
         {
             var chunkStore = CreateChunkStore();
             var list = TrecsList.Alloc<int>(chunkStore);
-            NAssert.AreEqual(0, list.Read(chunkStore.Resolver).Capacity);
 
             list.EnsureCapacity(chunkStore, 1);
             var write = list.Write(chunkStore.Resolver);
@@ -116,15 +115,79 @@ namespace Trecs.Tests
         }
 
         [Test]
-        public void Add_PastCapacity_Throws()
+        public void NativeAdd_PastCapacity_Grows()
         {
             var chunkStore = CreateChunkStore();
             var list = TrecsList.Alloc<int>(chunkStore, 2);
             var write = list.Write(chunkStore.Resolver);
-            write.Add(1);
-            write.Add(2);
+            var capacity = write.Capacity;
+            for (int i = 0; i <= capacity; i++)
+            {
+                write.Add(i);
+            }
 
-            NAssert.Throws<TrecsException>(() => write.Add(3));
+            NAssert.AreEqual(capacity + 1, write.Count);
+            NAssert.Greater(write.Capacity, capacity);
+            NAssert.AreEqual(capacity, write[capacity]);
+
+            list.Dispose(chunkStore);
+            chunkStore.Dispose();
+        }
+
+        [Test]
+        public void ManagedInsert_ShiftsLaterElements_AndGrows()
+        {
+            using var env = EcsTestHelper.CreateEnvironment(TestTemplates.SimpleAlpha);
+            var world = env.Accessor;
+            var list = TrecsList.Alloc<int>(world);
+            var write = list.Write(world);
+            write.Add(1);
+            write.Add(3);
+
+            write.Insert(1, 2);
+            write.Insert(0, 0);
+            write.Insert(4, 4);
+            write.Insert(0, write[2]);
+
+            NAssert.AreEqual(6, write.Count);
+            var expected = new[] { 2, 0, 1, 2, 3, 4 };
+            for (int i = 0; i < expected.Length; i++)
+            {
+                NAssert.AreEqual(expected[i], write[i], $"index {i}");
+            }
+
+            list.Dispose(world);
+        }
+
+        [Test]
+        public void InsertNoResize_PastCapacity_Throws()
+        {
+            var chunkStore = CreateChunkStore();
+            var list = TrecsList.Alloc<int>(chunkStore, 2);
+            var write = list.Write(chunkStore.Resolver);
+            for (int i = 0; i < write.Capacity; i++)
+            {
+                write.InsertNoResize(0, i);
+            }
+
+            NAssert.Throws<TrecsException>(() => write.InsertNoResize(0, -1));
+
+            list.Dispose(chunkStore);
+            chunkStore.Dispose();
+        }
+
+        [Test]
+        public void AddNoResize_PastCapacity_Throws()
+        {
+            var chunkStore = CreateChunkStore();
+            var list = TrecsList.Alloc<int>(chunkStore, 2);
+            var write = list.Write(chunkStore.Resolver);
+            for (int i = 0; i < write.Capacity; i++)
+            {
+                write.AddNoResize(i);
+            }
+
+            NAssert.Throws<TrecsException>(() => write.AddNoResize(-1));
 
             list.Dispose(chunkStore);
             chunkStore.Dispose();
@@ -206,9 +269,10 @@ namespace Trecs.Tests
             write.Add(2);
             write.Add(3);
 
+            var capacity = write.Capacity;
             write.Clear();
             NAssert.AreEqual(0, write.Count);
-            NAssert.AreEqual(8, write.Capacity);
+            NAssert.AreEqual(capacity, write.Capacity);
 
             list.Dispose(chunkStore);
             chunkStore.Dispose();
@@ -233,10 +297,6 @@ namespace Trecs.Tests
         [Test]
         public void AllocAndDispose_TracksLiveSlotsViaChunkStore()
         {
-            // TrecsList ownership lives entirely in the chunk store. Verify
-            // alloc/dispose by watching NumLiveAllocations there. Alloc<T>() with no
-            // initial capacity uses one slot (header only); disposal frees it (and
-            // any data buffer) via the two-Free pattern in TrecsList<T>.Dispose.
             var chunkStore = CreateChunkStore();
             NAssert.AreEqual(0, chunkStore.NumLiveAllocations);
 
@@ -256,14 +316,12 @@ namespace Trecs.Tests
         }
 
         [Test]
-        public void Dispose_FreesHeaderAndDataBufferImmediately()
+        public void Alloc_UsesOneAllocation_DisposeFreesIt()
         {
-            // With an initial capacity, Alloc reserves both a header slot and a
-            // data buffer slot — Dispose must release both so the chunk store
-            // returns to a clean state.
             var chunkStore = CreateChunkStore();
             var list = TrecsList.Alloc<int>(chunkStore, 4);
-            NAssert.AreEqual(2, chunkStore.NumLiveAllocations);
+            list.EnsureCapacity(chunkStore, 1000);
+            NAssert.AreEqual(1, chunkStore.NumLiveAllocations);
 
             list.Dispose(chunkStore);
             NAssert.AreEqual(0, chunkStore.NumLiveAllocations);
@@ -411,7 +469,7 @@ namespace Trecs.Tests
         }
 
         [Test]
-        public void WorldAccessor_AllocTrecsList_DefaultCapacityIsZero()
+        public void WorldAccessor_AllocTrecsList_DefaultCapacityFillsSmallestSlot()
         {
             using var env = EcsTestHelper.CreateEnvironment(TestTemplates.SimpleAlpha);
             var world = env.Accessor;
@@ -419,7 +477,7 @@ namespace Trecs.Tests
             var list = TrecsList.Alloc<int>(world);
             var read = list.Read(world);
             NAssert.AreEqual(0, read.Count);
-            NAssert.AreEqual(0, read.Capacity);
+            NAssert.AreEqual(2, read.Capacity);
 
             list.Dispose(world);
         }
@@ -431,7 +489,6 @@ namespace Trecs.Tests
             var world = env.Accessor;
 
             var list = TrecsList.Alloc<int>(world);
-            NAssert.AreEqual(0, list.Read(world).Capacity);
 
             var write = list.Write(world);
             for (int i = 0; i < 100; i++)
@@ -451,10 +508,6 @@ namespace Trecs.Tests
         [Test]
         public void ManagedWrite_CachedPointer_StaysValidAcrossSelfGrow()
         {
-            // The managed wrapper updates its cached data pointer in place on grow,
-            // so subsequent Add / indexer access on the same wrapper sees the new
-            // buffer. (The native wrapper, by contrast, caches at Open time and
-            // requires re-opening after a handle-side EnsureCapacity.)
             using var env = EcsTestHelper.CreateEnvironment(TestTemplates.SimpleAlpha);
             var world = env.Accessor;
 
@@ -513,48 +566,13 @@ namespace Trecs.Tests
             list.Dispose(world);
         }
 
-        // ── Version-stamp staleness detection ─────────────────────────
+        // ── Views across a grow ───────────────────────────────────────
         //
-        // The header carries a ushort Version bumped on every data-slot reallocation.
-        // Managed (ref struct) wrappers check version on every data-touching op, so any
-        // managed wrapper that didn't perform the grow itself throws on next use instead
-        // of dereferencing a freed buffer. This is plain integer compare — not gated on
-        // ENABLE_UNITY_COLLECTIONS_CHECKS — so it holds in shipping builds.
-        //
-        // Native wrappers validate version at construction only (matching NativeList
-        // semantics). Staleness after construction is caught by the AtomicSafetyHandle
-        // at schedule time in editor builds; in release it's the caller's responsibility
-        // to not mutate a collection while a native wrapper from a prior state is in use.
+        // Write views and managed views reach the block through the side-table entry on
+        // every access, so they stay valid when another view grows the list.
 
         [Test]
-        public void NativeRead_NoPerAccessVersionCheck_MatchesNativeListSemantics()
-        {
-            var chunkStore = CreateChunkStore();
-            var list = TrecsList.Alloc<int>(chunkStore, 4);
-            var write = list.Write(chunkStore.Resolver);
-            write.Add(7);
-
-            var read = list.Read(chunkStore.Resolver);
-            NAssert.AreEqual(7, read[0]);
-
-            list.EnsureCapacity(chunkStore, 64);
-
-            // Native wrappers validate at construction only, matching NativeList
-            // semantics. Per-access version/slot-alive checks are editor-only
-            // (AtomicSafetyHandle). The stale read still "works" — the old data
-            // pointer is freed memory, but no runtime check fires in release.
-            // In real usage, the job safety walker catches this at schedule time.
-            NAssert.DoesNotThrow(() =>
-            {
-                var _ = read.Count;
-            });
-
-            list.Dispose(chunkStore);
-            chunkStore.Dispose();
-        }
-
-        [Test]
-        public void NativeWrite_NoPerAccessVersionCheck_MatchesNativeListSemantics()
+        public void NativeWrite_SeesHandleGrow()
         {
             var chunkStore = CreateChunkStore();
             var list = TrecsList.Alloc<int>(chunkStore, 4);
@@ -563,11 +581,10 @@ namespace Trecs.Tests
 
             list.EnsureCapacity(chunkStore, 64);
 
-            // Same as read: native wrappers don't per-access version check.
-            NAssert.DoesNotThrow(() =>
-            {
-                var _ = write.Count;
-            });
+            NAssert.GreaterOrEqual(write.Capacity, 64);
+            write.Add(8);
+            NAssert.AreEqual(7, write[0]);
+            NAssert.AreEqual(8, write[1]);
 
             list.Dispose(chunkStore);
             chunkStore.Dispose();
@@ -576,8 +593,6 @@ namespace Trecs.Tests
         [Test]
         public void ManagedWrite_SelfGrow_DoesNotInvalidateItsOwnWrapper()
         {
-            // The growing wrapper re-syncs _capturedVersion. Subsequent ops on the same
-            // wrapper see the bumped version match and proceed normally.
             using var env = EcsTestHelper.CreateEnvironment(TestTemplates.SimpleAlpha);
             var world = env.Accessor;
 
@@ -597,11 +612,8 @@ namespace Trecs.Tests
         }
 
         [Test]
-        public void ManagedWrite_OtherWrapperGrew_StaleWrapperThrows()
+        public void ManagedWrite_SiblingGrew_WrapperStaysValid()
         {
-            // Two write wrappers on the same list. Second one triggers a grow via
-            // EnsureCapacity, which bumps the header version. First wrapper's next op
-            // catches the version mismatch.
             using var env = EcsTestHelper.CreateEnvironment(TestTemplates.SimpleAlpha);
             var world = env.Accessor;
 
@@ -610,62 +622,19 @@ namespace Trecs.Tests
             w1.Add(1);
 
             var w2 = list.Write(world);
-            w2.EnsureCapacity(64); // bumps version; w2 re-syncs, w1 doesn't
+            w2.EnsureCapacity(64);
 
-            // w1 is a ref struct so we can't capture it in NAssert.Throws's lambda —
-            // use try/catch instead.
-            bool threw = false;
-            try
-            {
-                w1.Add(2);
-            }
-            catch (TrecsException)
-            {
-                threw = true;
-            }
-            NAssert.IsTrue(threw, "w1 should throw on stale-version use after w2 grew");
-
-            // w2 stays usable.
-            w2.Add(2);
+            w1.Add(2);
             NAssert.AreEqual(2, w2.Count);
+            NAssert.AreEqual(2, w2[1]);
+            NAssert.GreaterOrEqual(w1.Capacity, 64);
 
             list.Dispose(world);
         }
 
         [Test]
-        public void ManagedWrite_OtherWrapperAdded_StaleWrapperThrows()
+        public void ManagedRead_SeesSiblingRemoveAt()
         {
-            // Every Add bumps version, matching List<T> enumerator semantics — even
-            // without a grow, a sibling wrapper that opened earlier is invalidated.
-            using var env = EcsTestHelper.CreateEnvironment(TestTemplates.SimpleAlpha);
-            var world = env.Accessor;
-
-            var list = TrecsList.Alloc<int>(world, 16);
-            var w1 = list.Write(world);
-            w1.Add(1);
-
-            var w2 = list.Write(world);
-            w2.Add(2); // bumps; capacity 16, no grow
-
-            bool threw = false;
-            try
-            {
-                w1.Add(3);
-            }
-            catch (TrecsException)
-            {
-                threw = true;
-            }
-            NAssert.IsTrue(threw, "w1 should throw after w2.Add bumped the version");
-
-            list.Dispose(world);
-        }
-
-        [Test]
-        public void ManagedRead_OtherWrapperRemovedAt_StaleReadThrows()
-        {
-            // RemoveAt shifts elements down — any other wrapper holding a stale
-            // interpretation of indices is invalidated.
             using var env = EcsTestHelper.CreateEnvironment(TestTemplates.SimpleAlpha);
             var world = env.Accessor;
 
@@ -676,52 +645,10 @@ namespace Trecs.Tests
             w.Add(30);
 
             var r = list.Read(world);
-            NAssert.AreEqual(20, r[1]);
+            list.Write(world).RemoveAt(0);
 
-            // RemoveAt bumps version.
-            var w2 = list.Write(world);
-            w2.RemoveAt(0);
-
-            bool threw = false;
-            try
-            {
-                var _ = r[0];
-            }
-            catch (TrecsException)
-            {
-                threw = true;
-            }
-            NAssert.IsTrue(threw, "r should throw after w2.RemoveAt bumped the version");
-
-            list.Dispose(world);
-        }
-
-        [Test]
-        public void ManagedRead_OtherWrapperCleared_StaleReadThrows()
-        {
-            using var env = EcsTestHelper.CreateEnvironment(TestTemplates.SimpleAlpha);
-            var world = env.Accessor;
-
-            var list = TrecsList.Alloc<int>(world, 8);
-            var w = list.Write(world);
-            w.Add(42);
-
-            var r = list.Read(world);
-            NAssert.AreEqual(42, r[0]);
-
-            var w2 = list.Write(world);
-            w2.Clear();
-
-            bool threw = false;
-            try
-            {
-                var _ = r.Count;
-            }
-            catch (TrecsException)
-            {
-                threw = true;
-            }
-            NAssert.IsTrue(threw, "r should throw after w2.Clear bumped the version");
+            NAssert.AreEqual(2, r.Count);
+            NAssert.AreEqual(20, r[0]);
 
             list.Dispose(world);
         }
@@ -1252,11 +1179,8 @@ namespace Trecs.Tests
         }
 
         [Test]
-        public void EnsureCapacity_NoOpWhenAlreadyMet_DoesNotBumpVersion()
+        public void EnsureCapacity_NoOpWhenAlreadyMet_KeepsWrapperValid()
         {
-            // EnsureCapacity returns early when minCapacity <= Capacity; that path
-            // must not bump the version, otherwise any live wrapper would invalidate
-            // for no reason.
             var chunkStore = CreateChunkStore();
             var list = TrecsList.Alloc<int>(chunkStore, 16);
             var w = list.Write(chunkStore.Resolver);
@@ -1266,7 +1190,6 @@ namespace Trecs.Tests
             list.EnsureCapacity(chunkStore, 4); // <= current capacity 16, no-op
             list.EnsureCapacity(chunkStore, 16); // exact match, also no-op
 
-            // w must still be valid; no version bump means the captured version still matches.
             w.Add(3);
             NAssert.AreEqual(3, w.Count);
             NAssert.AreEqual(3, w[2]);
@@ -1276,11 +1199,8 @@ namespace Trecs.Tests
         }
 
         [Test]
-        public void NativeWrite_IndexerAssign_DoesNotBumpVersion()
+        public void NativeWrite_IndexerAssign_VisibleToSiblingRead()
         {
-            // Parity with the managed test: in-place value mutation via the ref
-            // indexer doesn't bump version (the wrapper can't intercept ref
-            // assignments). A read on a sibling wrapper continues to work.
             var chunkStore = CreateChunkStore();
             var list = TrecsList.Alloc<int>(chunkStore, 4);
             var w = list.Write(chunkStore.Resolver);
@@ -1290,7 +1210,7 @@ namespace Trecs.Tests
             var r = list.Read(chunkStore.Resolver);
             NAssert.AreEqual(20, r[1]);
 
-            w[1] = 99; // in-place — no bump
+            w[1] = 99;
 
             NAssert.AreEqual(99, r[1]);
 
@@ -1299,50 +1219,8 @@ namespace Trecs.Tests
         }
 
         [Test]
-        public void ManagedRead_Foreach_ThrowsOnSiblingMutationMidIteration()
+        public void ManagedWrite_IndexerAssign_VisibleToSiblingRead()
         {
-            // Parity with the native test, but the managed enumerator is a ref struct
-            // so we can't capture it in NAssert.Throws's lambda — use try/catch instead.
-            using var env = EcsTestHelper.CreateEnvironment(TestTemplates.SimpleAlpha);
-            var world = env.Accessor;
-
-            var list = TrecsList.Alloc<int>(world, 16);
-            var w = list.Write(world);
-            for (int i = 0; i < 5; i++)
-            {
-                w.Add(i);
-            }
-
-            var r = list.Read(world);
-            var iter = r.GetEnumerator();
-            NAssert.IsTrue(iter.MoveNext());
-            var _ = iter.Current;
-
-            // Sibling mutation bumps version.
-            var w2 = list.Write(world);
-            w2.Add(999);
-
-            bool threw = false;
-            try
-            {
-                iter.MoveNext();
-            }
-            catch (TrecsException)
-            {
-                threw = true;
-            }
-            NAssert.IsTrue(threw, "managed enumerator should throw on stale version");
-
-            list.Dispose(world);
-        }
-
-        [Test]
-        public void ManagedWrite_IndexerAssign_DoesNotBumpVersion()
-        {
-            // In-place value mutation via the ref indexer doesn't bump — the wrapper
-            // can't intercept ref assignments, and the new value is immediately
-            // visible to any reader through the shared data buffer, so there's
-            // nothing stale to invalidate.
             using var env = EcsTestHelper.CreateEnvironment(TestTemplates.SimpleAlpha);
             var world = env.Accessor;
 
@@ -1354,10 +1232,8 @@ namespace Trecs.Tests
             var r = list.Read(world);
             NAssert.AreEqual(20, r[1]);
 
-            // In-place assign through ref indexer — no version bump.
             w[1] = 99;
 
-            // r is still valid; it sees the new value through the shared buffer.
             NAssert.AreEqual(99, r[1]);
 
             list.Dispose(world);
@@ -1411,11 +1287,6 @@ namespace Trecs.Tests
         [Test]
         public void ManagedWrite_Foreach_MutatesInPlaceViaRefCurrent()
         {
-            // The whole point of GetEnumerator on the Write view: Current returns
-            // ref T, so `foreach (ref var x in w) x = ...` mutates the backing
-            // buffer in place without needing an indexed loop. In-place ref
-            // assignment doesn't bump the version (same reasoning as the indexer
-            // test above), so iteration completes cleanly.
             using var env = EcsTestHelper.CreateEnvironment(TestTemplates.SimpleAlpha);
             var world = env.Accessor;
 
@@ -1436,46 +1307,6 @@ namespace Trecs.Tests
             {
                 NAssert.AreEqual(i * 10, r[i]);
             }
-
-            list.Dispose(world);
-        }
-
-        [Test]
-        public void ManagedWrite_Foreach_ThrowsOnSiblingMutationMidIteration()
-        {
-            // Structural mutation through any other wrapper bumps the header's
-            // version; the enumerator holds a copy of the Write view with the
-            // captured version from open-time, so the next MoveNext throws via
-            // CheckVersion in the indexer. Mirrors the Read-view test —
-            // foreach-write is not a license to bypass List<T> enumerator semantics.
-            using var env = EcsTestHelper.CreateEnvironment(TestTemplates.SimpleAlpha);
-            var world = env.Accessor;
-
-            var list = TrecsList.Alloc<int>(world, 16);
-            var w = list.Write(world);
-            for (int i = 0; i < 5; i++)
-            {
-                w.Add(i);
-            }
-
-            var iter = w.GetEnumerator();
-            NAssert.IsTrue(iter.MoveNext());
-            var _ = iter.Current;
-
-            // Sibling Write mutation bumps the version.
-            var w2 = list.Write(world);
-            w2.Add(999);
-
-            bool threw = false;
-            try
-            {
-                iter.MoveNext();
-            }
-            catch (TrecsException)
-            {
-                threw = true;
-            }
-            NAssert.IsTrue(threw, "write enumerator should throw on stale version");
 
             list.Dispose(world);
         }
@@ -1534,39 +1365,6 @@ namespace Trecs.Tests
             NAssert.AreEqual(4, r[1]);
             NAssert.AreEqual(2, r[2]);
             NAssert.AreEqual(1, r[3]);
-
-            list.Dispose(world);
-        }
-
-        [Test]
-        public void ManagedWrite_Sort_BumpsVersion_InvalidatesSiblingWrapper()
-        {
-            using var env = EcsTestHelper.CreateEnvironment(TestTemplates.SimpleAlpha);
-            var world = env.Accessor;
-
-            var list = TrecsList.Alloc<int>(world, 4);
-            var w = list.Write(world);
-            foreach (var v in new[] { 3, 1, 2 })
-            {
-                w.Add(v);
-            }
-
-            var r = list.Read(world);
-            // Touch r once to confirm it's live pre-sort.
-            NAssert.AreEqual(3, r[0]);
-
-            w.Sort(default(IntAscComparer));
-
-            bool threw = false;
-            try
-            {
-                var _ = r[0];
-            }
-            catch (TrecsException)
-            {
-                threw = true;
-            }
-            NAssert.IsTrue(threw, "sibling Read should throw after sort bumps version");
 
             list.Dispose(world);
         }

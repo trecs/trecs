@@ -428,7 +428,8 @@ namespace Trecs
                 settings,
                 interpolatedPreviousSaverManager,
                 jobScheduler,
-                entityInputQueue
+                entityInputQueue,
+                nativeUniqueChunkStore
             );
 
             var world = new World(

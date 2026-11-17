@@ -558,7 +558,7 @@ namespace Trecs.Tests
             var w = dict.Write(cs);
             w.Add(1, 1.0f);
 
-            NAssert.AreEqual(2, cs.NumLiveAllocations); // header + data
+            NAssert.AreEqual(1, cs.NumLiveAllocations);
             dict.Dispose(cs);
             NAssert.AreEqual(0, cs.NumLiveAllocations);
 
@@ -605,34 +605,7 @@ namespace Trecs.Tests
         }
 
         [Test]
-        public void VersionStaleness_ManagedWriteWrapper_DetectsExternalMutation()
-        {
-            var cs = CreateChunkStore();
-            var dict = TrecsDictionary.Alloc<int, float>(cs, 4);
-            var w1 = dict.Write(cs);
-            w1.Add(1, 1.0f);
-
-            var w2 = dict.Write(cs);
-            w2.Add(2, 2.0f);
-
-            // Managed wrappers check version per-access — catches staleness.
-            bool threw = false;
-            try
-            {
-                var _ = w1.Count;
-            }
-            catch (TrecsException)
-            {
-                threw = true;
-            }
-            NAssert.IsTrue(threw, "Managed write wrapper should detect stale version");
-
-            dict.Dispose(cs);
-            cs.Dispose();
-        }
-
-        [Test]
-        public void VersionStaleness_ManagedReadWrapper_DetectsMutation()
+        public void ManagedRead_SeesSiblingGrow()
         {
             var cs = CreateChunkStore();
             var dict = TrecsDictionary.Alloc<int, float>(cs, 4);
@@ -640,29 +613,20 @@ namespace Trecs.Tests
             w.Add(1, 1.0f);
 
             var read = dict.Read(cs);
-            NAssert.AreEqual(1, read.Count);
-
             var w2 = dict.Write(cs);
-            w2.Add(2, 2.0f);
+            for (int i = 2; i < 100; i++)
+                w2.Add(i, i);
 
-            // Managed wrappers check version per-access — catches staleness.
-            bool threw = false;
-            try
-            {
-                var _ = read.Count;
-            }
-            catch (TrecsException)
-            {
-                threw = true;
-            }
-            NAssert.IsTrue(threw, "Managed read wrapper should detect stale version");
+            NAssert.AreEqual(99, read.Count);
+            NAssert.AreEqual(1.0f, read[1]);
+            NAssert.AreEqual(50f, read[50]);
 
             dict.Dispose(cs);
             cs.Dispose();
         }
 
         [Test]
-        public void VersionStaleness_NativeWrappers_NoPerAccessCheck()
+        public void NativeWrite_SeesSiblingAdd()
         {
             var cs = CreateChunkStore();
             var dict = TrecsDictionary.Alloc<int, float>(cs, 4);
@@ -672,27 +636,40 @@ namespace Trecs.Tests
             var w2 = dict.Write(cs.Resolver);
             w2.Add(2, 2.0f);
 
-            // Native wrappers validate at construction only, matching NativeList semantics.
-            NAssert.DoesNotThrow(() =>
-            {
-                var _ = w1.Count;
-            });
+            NAssert.AreEqual(2, w1.Count);
 
             dict.Dispose(cs);
             cs.Dispose();
         }
 
         [Test]
-        public void NativeWrite_CapacityExceeded_Throws()
+        public void NativeWrite_PastCapacity_Grows()
         {
             var cs = CreateChunkStore();
             var dict = TrecsDictionary.Alloc<int, float>(cs, 2);
             var nw = dict.Write(cs.Resolver);
+            var capacity = nw.Capacity;
+            for (int i = 0; i <= capacity; i++)
+                nw.Add(i, i);
 
-            nw.Add(1, 1.0f);
-            nw.Add(2, 2.0f);
+            NAssert.Greater(nw.Capacity, capacity);
+            for (int i = 0; i <= capacity; i++)
+                NAssert.AreEqual((float)i, nw[i]);
 
-            NAssert.Throws<TrecsException>(() => nw.Add(3, 3.0f));
+            dict.Dispose(cs);
+            cs.Dispose();
+        }
+
+        [Test]
+        public void NativeWrite_AddNoResizePastCapacity_Throws()
+        {
+            var cs = CreateChunkStore();
+            var dict = TrecsDictionary.Alloc<int, float>(cs, 2);
+            var nw = dict.Write(cs.Resolver);
+            for (int i = 0; i < nw.Capacity; i++)
+                nw.AddNoResize(i, i);
+
+            NAssert.Throws<TrecsException>(() => nw.AddNoResize(-1, 0f));
 
             dict.Dispose(cs);
             cs.Dispose();

@@ -5,35 +5,319 @@ using System.Runtime.InteropServices;
 using Trecs.Collections;
 using Trecs.Internal;
 using Unity.Collections.LowLevel.Unsafe;
+using Unity.Mathematics;
 
 namespace Trecs.Internal
 {
+    /// <summary>Front of a <see cref="TrecsDictionary{TKey, TValue}"/> block.</summary>
     [EditorBrowsable(EditorBrowsableState.Never)]
     public struct TrecsDictionaryHeader
     {
-        public PtrHandle DataHandle;
+        public ulong FastModMultiplier;
         public int Count;
         public int EntryCapacity;
         public int BucketCount;
-        public int NodeSize;
-        public int NodeAlign;
-        public int ValueSize;
-        public int ValueAlign;
-        public int Collisions;
-        public ulong FastModMultiplier;
-        public ushort Version;
     }
 
+    /// <summary>
+    /// Block layout of a <see cref="TrecsDictionary{TKey, TValue}"/>: header, nodes, values,
+    /// buckets (1-based index of a chain's last node, 0 when empty). Capacity fills the heap
+    /// slot; the bucket count is the largest prime ≤ capacity.
+    /// </summary>
     [EditorBrowsable(EditorBrowsableState.Never)]
-    public readonly struct TrecsDictionaryDataMarker<TKey, TValue>
+    public static unsafe class TrecsDictionaryLayout<TKey, TValue>
         where TKey : unmanaged, IEquatable<TKey>
-        where TValue : unmanaged { }
+        where TValue : unmanaged
+    {
+        static int NodeSize => UnsafeUtility.SizeOf<IterableDictionaryNode<TKey>>();
+        static int NodeAlign => UnsafeUtility.AlignOf<IterableDictionaryNode<TKey>>();
+        static int ValueAlign => UnsafeUtility.AlignOf<TValue>();
+        static int NodesOffset => AlignUp(sizeof(TrecsDictionaryHeader), NodeAlign);
+        static int EntryBytes => NodeSize + sizeof(TValue) + sizeof(int);
+
+        // Alignment padding before the values and before the buckets.
+        static int Padding => ValueAlign - 1 + sizeof(int) - 1;
+
+        public static int Alignment =>
+            math.max(
+                UnsafeUtility.AlignOf<TrecsDictionaryHeader>(),
+                math.max(NodeAlign, ValueAlign)
+            );
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static int AlignUp(int value, int alignment) => (value + alignment - 1) & -alignment;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static int ValuesOffset(int capacity) =>
+            AlignUp(NodesOffset + capacity * NodeSize, ValueAlign);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static int BucketsOffset(int capacity) =>
+            AlignUp(ValuesOffset(capacity) + capacity * sizeof(TValue), sizeof(int));
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static IterableDictionaryNode<TKey>* Nodes(TrecsDictionaryHeader* header) =>
+            (IterableDictionaryNode<TKey>*)((byte*)header + NodesOffset);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static TValue* Values(TrecsDictionaryHeader* header) =>
+            (TValue*)((byte*)header + ValuesOffset(header->EntryCapacity));
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static int* Buckets(TrecsDictionaryHeader* header) =>
+            (int*)((byte*)header + BucketsOffset(header->EntryCapacity));
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static ref int Bucket(TrecsDictionaryHeader* header, int hash) =>
+            ref Buckets(header)[
+                TrecsDictionary.Reduce(
+                    (uint)hash,
+                    (uint)header->BucketCount,
+                    header->FastModMultiplier
+                )
+            ];
+
+        internal static int BlockSizeFor(int minCapacity)
+        {
+            var bytes = NodesOffset + (long)minCapacity * EntryBytes + Padding;
+            TrecsAssert.That(
+                bytes <= int.MaxValue,
+                "TrecsDictionary of {0} entries of {1} bytes exceeds int.MaxValue bytes",
+                minCapacity,
+                EntryBytes
+            );
+            return NativeHeapResolver.GetSlotByteSize((int)bytes, Alignment);
+        }
+
+        // Doubles the capacity, or takes minCapacity when doubling would pass int.MaxValue bytes.
+        static int GrowBlockSize(int capacity, int minCapacity)
+        {
+            var doubled = math.max((long)minCapacity, 2L * capacity);
+            var fits = NodesOffset + doubled * EntryBytes + Padding <= int.MaxValue;
+            return BlockSizeFor(fits ? (int)doubled : minCapacity);
+        }
+
+        internal static void SetCapacity(TrecsDictionaryHeader* header, int blockSize)
+        {
+            var capacity = math.max(0, (blockSize - NodesOffset - Padding) / EntryBytes);
+            var buckets = HashHelpers.GetPrimeAtMost(capacity);
+            header->EntryCapacity = capacity;
+            header->BucketCount = buckets;
+            header->FastModMultiplier =
+                buckets > 0 ? HashHelpers.GetFastModMultiplier((uint)buckets) : 0;
+        }
+
+        static int LiveBytes(TrecsDictionaryHeader* header) =>
+            ValuesOffset(header->EntryCapacity) + header->Count * sizeof(TValue);
+
+        // Lays out a grown block that holds a copy of the old block's first LiveBytes.
+        static void Relayout(TrecsDictionaryHeader* header, int oldCapacity, int blockSize)
+        {
+            var block = (byte*)header;
+            var count = header->Count;
+            var oldValues = block + ValuesOffset(oldCapacity);
+            SetCapacity(header, blockSize);
+            var values = (byte*)Values(header);
+            UnsafeUtility.MemMove(values, oldValues, (long)count * sizeof(TValue));
+            var liveNodesEnd = NodesOffset + count * NodeSize;
+            UnsafeUtility.MemClear(block + liveNodesEnd, values - block - liveNodesEnd);
+
+            var nodes = Nodes(header);
+            for (int i = 0; i < count; i++)
+            {
+                ref var bucket = ref Bucket(header, nodes[i].HashCode);
+                nodes[i].Previous = bucket - 1;
+                bucket = i + 1;
+            }
+        }
+
+        internal static TrecsDictionaryHeader* Grow(
+            NativeHeap heap,
+            PtrHandle handle,
+            TrecsDictionaryHeader* header,
+            int minCapacity
+        )
+        {
+            var oldCapacity = header->EntryCapacity;
+            var size = GrowBlockSize(oldCapacity, minCapacity);
+            var grown = (TrecsDictionaryHeader*)
+                heap.Reallocate(handle, size, Alignment, LiveBytes(header));
+            Relayout(grown, oldCapacity, size);
+            return grown;
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        internal static TrecsDictionaryHeader* GrowDetached(
+            NativeHeapEntry* slot,
+            PtrHandle handle,
+            NativeHeapDetachLog* log,
+            int minCapacity
+        )
+        {
+            var header = (TrecsDictionaryHeader*)slot->Address.ToPointer();
+            var oldCapacity = header->EntryCapacity;
+            var size = GrowBlockSize(oldCapacity, minCapacity);
+            var grown = (TrecsDictionaryHeader*)
+                DetachedBlock.Reallocate(slot, handle, log, size, LiveBytes(header));
+            Relayout(grown, oldCapacity, size);
+            return grown;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool TryGetIndex(TrecsDictionaryHeader* header, in TKey key, out int index) =>
+            TryFind(header, key, key.GetHashCode(), out index);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static bool TryFind(
+            TrecsDictionaryHeader* header,
+            in TKey key,
+            int hash,
+            out int index
+        )
+        {
+            if (header->BucketCount != 0)
+            {
+                var nodes = Nodes(header);
+                index = Bucket(header, hash) - 1;
+                while (index != -1)
+                {
+                    ref var node = ref nodes[index];
+                    if (node.HashCode == hash && node.Key.Equals(key))
+                    {
+                        return true;
+                    }
+                    index = node.Previous;
+                }
+            }
+            index = 0;
+            return false;
+        }
+
+        /// <summary>Appends a key known to be absent; the dictionary must have room.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static int AppendKey(TrecsDictionaryHeader* header, in TKey key, int hash)
+        {
+            var index = header->Count;
+            TrecsDebugAssert.That(
+                index < header->EntryCapacity,
+                "TrecsDictionary is full (capacity {0})",
+                header->EntryCapacity
+            );
+            ref var bucket = ref Bucket(header, hash);
+            ref var node = ref Nodes(header)[index];
+            node.Key = key;
+            node.HashCode = hash;
+            node.Previous = bucket - 1;
+            bucket = index + 1;
+            Values(header)[index] = default;
+            header->Count = index + 1;
+            return index;
+        }
+
+        // Swap-back removal: the last entry moves into the freed index.
+        internal static bool Remove(
+            TrecsDictionaryHeader* header,
+            in TKey key,
+            out TValue removedValue
+        )
+        {
+            if (header->BucketCount == 0)
+            {
+                removedValue = default;
+                return false;
+            }
+
+            var nodes = Nodes(header);
+            var values = Values(header);
+            var buckets = Buckets(header);
+            var bucketCount = (uint)header->BucketCount;
+            var fastMod = header->FastModMultiplier;
+            int hash = key.GetHashCode();
+            int bucketIndex = TrecsDictionary.Reduce((uint)hash, bucketCount, fastMod);
+
+            int indexToRemove = buckets[bucketIndex] - 1;
+            int itemAfterCurrent = -1;
+            while (indexToRemove != -1)
+            {
+                ref var node = ref nodes[indexToRemove];
+                if (node.HashCode == hash && node.Key.Equals(key))
+                {
+                    if (buckets[bucketIndex] - 1 == indexToRemove)
+                    {
+                        buckets[bucketIndex] = node.Previous + 1;
+                    }
+                    else
+                    {
+                        nodes[itemAfterCurrent].Previous = node.Previous;
+                    }
+                    break;
+                }
+                itemAfterCurrent = indexToRemove;
+                indexToRemove = node.Previous;
+            }
+
+            if (indexToRemove == -1)
+            {
+                removedValue = default;
+                return false;
+            }
+
+            removedValue = values[indexToRemove];
+            var lastIndex = header->Count - 1;
+            if (indexToRemove != lastIndex)
+            {
+                ref var nodeToMove = ref nodes[lastIndex];
+                var movingBucketIndex = TrecsDictionary.Reduce(
+                    (uint)nodeToMove.HashCode,
+                    bucketCount,
+                    fastMod
+                );
+
+                var linkedListIter = buckets[movingBucketIndex] - 1;
+                if (linkedListIter == lastIndex)
+                {
+                    buckets[movingBucketIndex] = indexToRemove + 1;
+                }
+                while (
+                    nodes[linkedListIter].Previous != -1
+                    && nodes[linkedListIter].Previous != lastIndex
+                )
+                {
+                    linkedListIter = nodes[linkedListIter].Previous;
+                }
+                if (nodes[linkedListIter].Previous != -1)
+                {
+                    nodes[linkedListIter].Previous = indexToRemove;
+                }
+
+                nodes[indexToRemove] = nodeToMove;
+                values[indexToRemove] = values[lastIndex];
+            }
+
+            header->Count = lastIndex;
+            return true;
+        }
+
+        internal static void Clear(TrecsDictionaryHeader* header)
+        {
+            if (header->Count == 0)
+            {
+                return;
+            }
+            header->Count = 0;
+            UnsafeUtility.MemClear(Buckets(header), header->BucketCount * sizeof(int));
+        }
+    }
 }
 
 namespace Trecs
 {
     public static class TrecsDictionary
     {
+        /// <summary>
+        /// Allocates a dictionary with room for at least <paramref name="initialCapacity"/>
+        /// entries. Capacity fills the heap slot.
+        /// </summary>
         public static TrecsDictionary<TKey, TValue> Alloc<TKey, TValue>(
             WorldAccessor world,
             int initialCapacity = 0,
@@ -53,7 +337,7 @@ namespace Trecs
         }
 
         internal static unsafe TrecsDictionary<TKey, TValue> Alloc<TKey, TValue>(
-            NativeHeap chunkStore,
+            NativeHeap heap,
             int initialCapacity = 0,
             [CallerFilePath] string callerFile = null,
             [CallerLineNumber] int callerLine = 0
@@ -62,156 +346,28 @@ namespace Trecs
             where TValue : unmanaged
         {
             TrecsDebugAssert.That(initialCapacity >= 0, "initialCapacity must be non-negative");
-
-            var nodeSize = UnsafeUtility.SizeOf<IterableDictionaryNode<TKey>>();
-            var nodeAlign = UnsafeUtility.AlignOf<IterableDictionaryNode<TKey>>();
-            var valueSize = UnsafeUtility.SizeOf<TValue>();
-            var valueAlign = UnsafeUtility.AlignOf<TValue>();
-
-            var handle = chunkStore.Alloc(
-                UnsafeUtility.SizeOf<TrecsDictionaryHeader>(),
-                UnsafeUtility.AlignOf<TrecsDictionaryHeader>(),
-                TypeId<TrecsDictionary<TKey, TValue>>.Value.Value,
-                out var headerAddress,
-                callerFile,
-                callerLine
-            );
-
-            var headerPtr = (TrecsDictionaryHeader*)headerAddress.ToPointer();
-            headerPtr->DataHandle = default;
-            headerPtr->Count = 0;
-            headerPtr->EntryCapacity = 0;
-            headerPtr->BucketCount = 0;
-            headerPtr->NodeSize = nodeSize;
-            headerPtr->NodeAlign = nodeAlign;
-            headerPtr->ValueSize = valueSize;
-            headerPtr->ValueAlign = valueAlign;
-            headerPtr->Collisions = 0;
-            headerPtr->FastModMultiplier = 0;
-            headerPtr->Version = 0;
-
-            if (initialCapacity > 0)
-            {
-                var bucketCount = HashHelpers.GetPrime(initialCapacity);
-                AllocDataSlot<TKey, TValue>(
-                    chunkStore,
-                    headerPtr,
-                    initialCapacity,
-                    bucketCount,
-                    callerFile,
-                    callerLine
-                );
-            }
-
-            return new TrecsDictionary<TKey, TValue>(handle);
-        }
-
-        internal static unsafe void AllocDataSlot<TKey, TValue>(
-            NativeHeap chunkStore,
-            TrecsDictionaryHeader* headerPtr,
-            int entryCapacity,
-            int bucketCount,
-            string callerFile,
-            int callerLine
-        )
-            where TKey : unmanaged, IEquatable<TKey>
-            where TValue : unmanaged
-        {
-            var byteSize = ComputeDataSlotByteSize(
-                entryCapacity,
-                bucketCount,
-                headerPtr->NodeSize,
-                headerPtr->ValueSize,
-                headerPtr->ValueAlign
-            );
-            var alignment = DataSlotAlignment(headerPtr->NodeAlign, headerPtr->ValueAlign);
-
-            var dataHandle = chunkStore.Alloc(
-                byteSize,
+            var alignment = TrecsDictionaryLayout<TKey, TValue>.Alignment;
+            TrecsAssert.That(
+                alignment <= DetachedBlock.MaxAlignment,
+                "TrecsDictionary entry alignment {0} exceeds {1}",
                 alignment,
-                TypeId<TrecsDictionaryDataMarker<TKey, TValue>>.Value.Value,
-                out _,
+                DetachedBlock.MaxAlignment
+            );
+
+            var size = TrecsDictionaryLayout<TKey, TValue>.BlockSizeFor(initialCapacity);
+            var handle = heap.Alloc(
+                size,
+                alignment,
+                TypeId<TrecsDictionary<TKey, TValue>>.Value.Value,
+                out var address,
                 callerFile,
                 callerLine
             );
-            headerPtr->DataHandle = dataHandle;
-            headerPtr->EntryCapacity = entryCapacity;
-            headerPtr->BucketCount = bucketCount;
-            headerPtr->FastModMultiplier =
-                bucketCount > 0 ? HashHelpers.GetFastModMultiplier((uint)bucketCount) : 0;
-        }
-
-        internal static int ComputeDataSlotByteSize(
-            int entryCapacity,
-            int bucketCount,
-            int nodeSize,
-            int valueSize,
-            int valueAlign
-        )
-        {
-            long nodesBytes = (long)entryCapacity * nodeSize;
-            long valuesOffset = AlignUpLong(nodesBytes, valueAlign);
-            long valuesBytes = (long)entryCapacity * valueSize;
-            long bucketsOffset = AlignUpLong(valuesOffset + valuesBytes, sizeof(int));
-            long total = bucketsOffset + (long)bucketCount * sizeof(int);
-
-            TrecsAssert.That(
-                total > 0 && total <= int.MaxValue,
-                "TrecsDictionary data slot byte size overflow: {0}",
-                total
+            TrecsDictionaryLayout<TKey, TValue>.SetCapacity(
+                (TrecsDictionaryHeader*)address.ToPointer(),
+                size
             );
-            return (int)total;
-        }
-
-        internal static int ValuesOffset(int entryCapacity, int nodeSize, int valueAlign)
-        {
-            return AlignUp(entryCapacity * nodeSize, valueAlign);
-        }
-
-        internal static int BucketsOffset(
-            int entryCapacity,
-            int nodeSize,
-            int valueAlign,
-            int valueSize
-        )
-        {
-            var valuesOff = ValuesOffset(entryCapacity, nodeSize, valueAlign);
-            return AlignUp(valuesOff + entryCapacity * valueSize, sizeof(int));
-        }
-
-        internal static int DataSlotAlignment(int nodeAlign, int valueAlign)
-        {
-            var a = Math.Max(nodeAlign, valueAlign);
-            return Math.Max(a, sizeof(int));
-        }
-
-        internal static int ComputeNewEntryCapacity(
-            int currentCapacity,
-            int minCapacity,
-            int nodeSize,
-            int valueSize
-        )
-        {
-            var newCap = currentCapacity == 0 ? 4 : currentCapacity;
-            while (newCap < minCapacity)
-            {
-                if (newCap > int.MaxValue / 2)
-                {
-                    newCap = minCapacity;
-                    break;
-                }
-                newCap *= 2;
-            }
-            var approxBytes = (long)newCap * (nodeSize + valueSize);
-            TrecsAssert.That(
-                approxBytes <= int.MaxValue,
-                "TrecsDictionary capacity overflow: {0} entries × ({1}+{2}) bytes = {3} exceeds int.MaxValue",
-                newCap,
-                nodeSize,
-                valueSize,
-                approxBytes
-            );
-            return newCap;
+            return new TrecsDictionary<TKey, TValue>(handle);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -221,20 +377,14 @@ namespace Trecs
                 return (int)HashHelpers.FastMod(hashcode, N, fastModBucketsMultiplier);
             return (int)hashcode;
         }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        internal static int AlignUp(int value, int alignment)
-        {
-            return (value + alignment - 1) & ~(alignment - 1);
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        static long AlignUpLong(long value, int alignment)
-        {
-            return (value + alignment - 1) & ~((long)alignment - 1);
-        }
     }
 
+    /// <summary>
+    /// A growable hash dictionary of unmanaged keys and values on the world's
+    /// <see cref="NativeHeap"/>, held by a 4-byte handle that never changes. Every write view
+    /// grows, in a job too; <c>AddNoResize</c> and siblings skip the capacity branch. See
+    /// <see cref="TrecsList{T}"/> for the view and growth model.
+    /// </summary>
     [StructLayout(LayoutKind.Sequential, Pack = 1)]
     public readonly struct TrecsDictionary<TKey, TValue> : IEquatable<TrecsDictionary<TKey, TValue>>
         where TKey : unmanaged, IEquatable<TKey>
@@ -255,233 +405,43 @@ namespace Trecs
             Dispose(world.NativeUniqueChunkStore);
         }
 
-        internal readonly unsafe void Dispose(NativeHeap chunkStore)
+        internal readonly unsafe void Dispose(NativeHeap heap)
         {
-            TrecsDebugAssert.That(Handle.Value != 0);
-            var headerEntry = ResolveHeaderEntry(chunkStore);
-            var dataHandle = ((TrecsDictionaryHeader*)headerEntry.Address.ToPointer())->DataHandle;
-            chunkStore.Free(Handle);
-            if (!dataHandle.IsNull)
-            {
-                chunkStore.Free(dataHandle);
-            }
+            ResolveSlot(in heap.Resolver, out _);
+            heap.Free(Handle);
         }
 
-        internal readonly unsafe void EnsureCapacity(
-            NativeHeap chunkStore,
-            int minCapacity,
-            [CallerFilePath] string callerFile = null,
-            [CallerLineNumber] int callerLine = 0
-        )
+        internal readonly unsafe void EnsureCapacity(NativeHeap heap, int minCapacity)
         {
             TrecsDebugAssert.That(minCapacity >= 0, "minCapacity must be non-negative");
-
-            var entry = ResolveHeaderEntry(chunkStore);
-            var headerPtr = (TrecsDictionaryHeader*)entry.Address.ToPointer();
-
-            if (minCapacity <= headerPtr->EntryCapacity)
-                return;
-
-#if ENABLE_UNITY_COLLECTIONS_CHECKS
-            AtomicSafetyHandle.CheckDeallocateAndThrow(entry.Safety);
-#endif
-
-            var newEntryCapacity = TrecsDictionary.ComputeNewEntryCapacity(
-                headerPtr->EntryCapacity,
-                minCapacity,
-                headerPtr->NodeSize,
-                headerPtr->ValueSize
-            );
-            var newBucketCount = HashHelpers.GetPrime(newEntryCapacity);
-
-            GrowDataSlot<TKey, TValue>(
-                chunkStore,
-                headerPtr,
-                newEntryCapacity,
-                newBucketCount,
-                callerFile,
-                callerLine
-            );
-            unchecked
+            var header = (TrecsDictionaryHeader*)
+                ResolveSlot(in heap.Resolver, out _).Address.ToPointer();
+            if (minCapacity > header->EntryCapacity)
             {
-                headerPtr->Version++;
-            }
-        }
-
-        internal static unsafe void GrowDataSlot<TK, TV>(
-            NativeHeap chunkStore,
-            TrecsDictionaryHeader* headerPtr,
-            int newEntryCapacity,
-            int newBucketCount,
-            string callerFile = null,
-            int callerLine = 0
-        )
-            where TK : unmanaged, IEquatable<TK>
-            where TV : unmanaged
-        {
-            var oldDataHandle = headerPtr->DataHandle;
-            var count = headerPtr->Count;
-
-            var newByteSize = TrecsDictionary.ComputeDataSlotByteSize(
-                newEntryCapacity,
-                newBucketCount,
-                headerPtr->NodeSize,
-                headerPtr->ValueSize,
-                headerPtr->ValueAlign
-            );
-            var alignment = TrecsDictionary.DataSlotAlignment(
-                headerPtr->NodeAlign,
-                headerPtr->ValueAlign
-            );
-
-            var newDataHandle = chunkStore.Alloc(
-                newByteSize,
-                alignment,
-                TypeId<TrecsDictionaryDataMarker<TK, TV>>.Value.Value,
-                out var newDataAddress,
-                callerFile,
-                callerLine
-            );
-
-            var newBase = (byte*)newDataAddress.ToPointer();
-
-            if (count > 0 && !oldDataHandle.IsNull)
-            {
-                var oldDataEntry = chunkStore.ResolveEntry(oldDataHandle);
-                var oldBase = (byte*)oldDataEntry.Address.ToPointer();
-
-                var oldValuesOffset = TrecsDictionary.ValuesOffset(
-                    headerPtr->EntryCapacity,
-                    headerPtr->NodeSize,
-                    headerPtr->ValueAlign
-                );
-                var newValuesOffset = TrecsDictionary.ValuesOffset(
-                    newEntryCapacity,
-                    headerPtr->NodeSize,
-                    headerPtr->ValueAlign
-                );
-
-                // Copy nodes
-                UnsafeUtility.MemCpy(newBase, oldBase, (long)count * headerPtr->NodeSize);
-                // Copy values
-                UnsafeUtility.MemCpy(
-                    newBase + newValuesOffset,
-                    oldBase + oldValuesOffset,
-                    (long)count * headerPtr->ValueSize
-                );
-            }
-
-            headerPtr->DataHandle = newDataHandle;
-            headerPtr->EntryCapacity = newEntryCapacity;
-            headerPtr->BucketCount = newBucketCount;
-            headerPtr->FastModMultiplier =
-                newBucketCount > 0 ? HashHelpers.GetFastModMultiplier((uint)newBucketCount) : 0;
-
-            // Rebuild buckets from scratch
-            var newBucketsOffset = TrecsDictionary.BucketsOffset(
-                newEntryCapacity,
-                headerPtr->NodeSize,
-                headerPtr->ValueAlign,
-                headerPtr->ValueSize
-            );
-            var newBuckets = (int*)(newBase + newBucketsOffset);
-            var newNodes = (IterableDictionaryNode<TK>*)newBase;
-            headerPtr->Collisions = 0;
-            var bucketsCapacity = (uint)newBucketCount;
-            var fmm = headerPtr->FastModMultiplier;
-
-            for (int i = 0; i < count; i++)
-            {
-                ref var node = ref newNodes[i];
-                var bi = TrecsDictionary.Reduce((uint)node.HashCode, bucketsCapacity, fmm);
-                int existingValueIndex = newBuckets[bi] - 1;
-                newBuckets[bi] = i + 1;
-
-                if (existingValueIndex == -1)
-                {
-                    node.Previous = -1;
-                }
-                else
-                {
-                    headerPtr->Collisions++;
-                    node.Previous = existingValueIndex;
-                }
-            }
-
-            if (!oldDataHandle.IsNull)
-            {
-                chunkStore.Free(oldDataHandle);
+                TrecsDictionaryLayout<TKey, TValue>.Grow(heap, Handle, header, minCapacity);
             }
         }
 
         public readonly TrecsDictionaryRead<TKey, TValue> Read(WorldAccessor world) =>
             Read(world.NativeUniqueChunkStore);
 
-        internal readonly unsafe TrecsDictionaryRead<TKey, TValue> Read(NativeHeap chunkStore)
+        internal readonly unsafe TrecsDictionaryRead<TKey, TValue> Read(NativeHeap heap)
         {
-            ResolveHeaderAndData(
-                in chunkStore.Resolver,
-                out var headerPtr,
-                out var nodes,
-                out var values,
-                out var buckets,
-                out var headerEntry,
-                out var headerSlot
-            );
+            var entry = ResolveSlot(in heap.Resolver, out var slot);
 #if ENABLE_UNITY_COLLECTIONS_CHECKS
-            return new TrecsDictionaryRead<TKey, TValue>(
-                headerPtr,
-                nodes,
-                values,
-                buckets,
-                headerSlot,
-                headerEntry.Generation,
-                headerEntry.Safety
-            );
+            return new TrecsDictionaryRead<TKey, TValue>(slot, Handle, entry.Safety);
 #else
-            return new TrecsDictionaryRead<TKey, TValue>(
-                headerPtr,
-                nodes,
-                values,
-                buckets,
-                headerSlot,
-                headerEntry.Generation
-            );
+            return new TrecsDictionaryRead<TKey, TValue>(slot, Handle);
 #endif
         }
 
-        internal readonly unsafe TrecsDictionaryWrite<TKey, TValue> Write(NativeHeap chunkStore)
+        internal readonly unsafe TrecsDictionaryWrite<TKey, TValue> Write(NativeHeap heap)
         {
-            ResolveHeaderAndData(
-                in chunkStore.Resolver,
-                out var headerPtr,
-                out var nodes,
-                out var values,
-                out var buckets,
-                out var headerEntry,
-                out var headerSlot
-            );
+            var entry = ResolveSlot(in heap.Resolver, out var slot);
 #if ENABLE_UNITY_COLLECTIONS_CHECKS
-            return new TrecsDictionaryWrite<TKey, TValue>(
-                headerPtr,
-                nodes,
-                values,
-                buckets,
-                chunkStore,
-                headerSlot,
-                headerEntry.Generation,
-                headerEntry.Safety
-            );
+            return new TrecsDictionaryWrite<TKey, TValue>(slot, Handle, heap, entry.Safety);
 #else
-            return new TrecsDictionaryWrite<TKey, TValue>(
-                headerPtr,
-                nodes,
-                values,
-                buckets,
-                chunkStore,
-                headerSlot,
-                headerEntry.Generation
-            );
+            return new TrecsDictionaryWrite<TKey, TValue>(slot, Handle, heap);
 #endif
         }
 
@@ -501,34 +461,12 @@ namespace Trecs
             in NativeHeapResolver resolver
         )
         {
-            ResolveHeaderAndData(
-                in resolver,
-                out var headerPtr,
-                out var nodes,
-                out var values,
-                out var buckets,
-                out var headerEntry,
-                out var headerSlot
-            );
+            var entry = ResolveSlot(in resolver, out _);
+            var header = (TrecsDictionaryHeader*)entry.Address.ToPointer();
 #if ENABLE_UNITY_COLLECTIONS_CHECKS
-            return new NativeTrecsDictionaryRead<TKey, TValue>(
-                headerPtr,
-                nodes,
-                values,
-                buckets,
-                headerSlot,
-                headerEntry.Generation,
-                headerEntry.Safety
-            );
+            return new NativeTrecsDictionaryRead<TKey, TValue>(header, entry.Safety);
 #else
-            return new NativeTrecsDictionaryRead<TKey, TValue>(
-                headerPtr,
-                nodes,
-                values,
-                buckets,
-                headerSlot,
-                headerEntry.Generation
-            );
+            return new NativeTrecsDictionaryRead<TKey, TValue>(header);
 #endif
         }
 
@@ -537,106 +475,33 @@ namespace Trecs
         )
         {
             resolver.AssertCanMutateHeap();
-            ResolveHeaderAndData(
-                in resolver,
-                out var headerPtr,
-                out var nodes,
-                out var values,
-                out var buckets,
-                out var headerEntry,
-                out var headerSlot
-            );
+            var entry = ResolveSlot(in resolver, out var slot);
 #if ENABLE_UNITY_COLLECTIONS_CHECKS
             return new NativeTrecsDictionaryWrite<TKey, TValue>(
-                headerPtr,
-                nodes,
-                values,
-                buckets,
-                headerSlot,
-                headerEntry.Generation,
-                headerEntry.Safety
+                slot,
+                Handle,
+                resolver.DetachLog,
+                entry.Safety
             );
 #else
-            return new NativeTrecsDictionaryWrite<TKey, TValue>(
-                headerPtr,
-                nodes,
-                values,
-                buckets,
-                headerSlot,
-                headerEntry.Generation
-            );
+            return new NativeTrecsDictionaryWrite<TKey, TValue>(slot, Handle, resolver.DetachLog);
 #endif
         }
 
-        readonly unsafe void ResolveHeaderAndData(
+        readonly unsafe NativeHeapEntry ResolveSlot(
             in NativeHeapResolver resolver,
-            out TrecsDictionaryHeader* headerPtr,
-            out IterableDictionaryNode<TKey>* nodes,
-            out TValue* values,
-            out int* buckets,
-            out NativeHeapEntry headerEntry,
-            out NativeHeapEntry* headerSlot
+            out NativeHeapEntry* slot
         )
         {
-            headerEntry = resolver.ResolveEntryWithSlotPtr(Handle, out headerSlot);
-            AssertHeaderTypeHash(headerEntry.TypeHash);
-            headerPtr = (TrecsDictionaryHeader*)headerEntry.Address.ToPointer();
-            nodes = null;
-            values = null;
-            buckets = null;
-            if (!headerPtr->DataHandle.IsNull)
-            {
-                var dataEntry = resolver.ResolveEntry(headerPtr->DataHandle);
-                AssertDataTypeHash(headerPtr->DataHandle.Value, dataEntry.TypeHash);
-                var dataBase = (byte*)dataEntry.Address.ToPointer();
-                nodes = (IterableDictionaryNode<TKey>*)dataBase;
-                var valuesOffset = TrecsDictionary.ValuesOffset(
-                    headerPtr->EntryCapacity,
-                    headerPtr->NodeSize,
-                    headerPtr->ValueAlign
-                );
-                values = (TValue*)(dataBase + valuesOffset);
-                var bucketsOffset = TrecsDictionary.BucketsOffset(
-                    headerPtr->EntryCapacity,
-                    headerPtr->NodeSize,
-                    headerPtr->ValueAlign,
-                    headerPtr->ValueSize
-                );
-                buckets = (int*)(dataBase + bucketsOffset);
-            }
-        }
-
-        readonly NativeHeapEntry ResolveHeaderEntry(NativeHeap chunkStore)
-        {
-            TrecsDebugAssert.That(
-                Handle.Value != 0,
-                "Attempted to resolve null TrecsDictionary handle"
-            );
-            var entry = chunkStore.ResolveEntry(Handle);
-            AssertHeaderTypeHash(entry.TypeHash);
-            return entry;
-        }
-
-        readonly void AssertHeaderTypeHash(int storedHash)
-        {
+            var entry = resolver.ResolveEntryWithSlotPtr(Handle, out slot);
             TrecsAssert.That(
-                storedHash == TypeId<TrecsDictionary<TKey, TValue>>.Value.Value,
-                "TrecsDictionary header type-hash mismatch for handle {0}: stored {1} != expected {2}",
+                entry.TypeHash == TypeId<TrecsDictionary<TKey, TValue>>.Value.Value,
+                "TrecsDictionary type-hash mismatch for handle {0}: stored {1} != expected {2}",
                 Handle.Value,
-                storedHash,
+                entry.TypeHash,
                 TypeId<TrecsDictionary<TKey, TValue>>.Value.Value
             );
-        }
-
-        static void AssertDataTypeHash(uint dataHandleValue, int storedHash)
-        {
-            TrecsAssert.That(
-                storedHash == TypeId<TrecsDictionaryDataMarker<TKey, TValue>>.Value.Value,
-                "TrecsDictionary data type-hash mismatch for handle {0}: stored {1} != expected {2}",
-                dataHandleValue,
-                storedHash,
-                TypeId<TrecsDictionaryDataMarker<TKey, TValue>>.Value.Value
-            );
+            return entry;
         }
 
         public readonly bool Equals(TrecsDictionary<TKey, TValue> other) =>
@@ -685,18 +550,158 @@ namespace Trecs
             where TKey : unmanaged, IEquatable<TKey>
             where TValue : unmanaged => dict.Write(in resolver);
 
+        /// <summary>
+        /// Grows the dictionary to hold at least <paramref name="minCapacity"/> entries,
+        /// doubling past the current capacity. Main thread; throws if a job still holds a view.
+        /// </summary>
         public static void EnsureCapacity<TKey, TValue>(
             this ref TrecsDictionary<TKey, TValue> dict,
             WorldAccessor world,
-            int minCapacity,
-            [CallerFilePath] string callerFile = null,
-            [CallerLineNumber] int callerLine = 0
+            int minCapacity
         )
             where TKey : unmanaged, IEquatable<TKey>
             where TValue : unmanaged
         {
             world.AssertCanMutateHeap();
-            dict.EnsureCapacity(world.NativeUniqueChunkStore, minCapacity, callerFile, callerLine);
+            dict.EnsureCapacity(world.NativeUniqueChunkStore, minCapacity);
         }
+    }
+
+    /// <summary>Keys of a dictionary view in index order, valid until the dictionary changes.</summary>
+    public unsafe struct TrecsDictionaryKeys<TKey>
+        where TKey : unmanaged, IEquatable<TKey>
+    {
+        [NativeDisableUnsafePtrRestriction]
+        readonly IterableDictionaryNode<TKey>* _nodes;
+        readonly int _count;
+        int _index;
+
+        internal TrecsDictionaryKeys(IterableDictionaryNode<TKey>* nodes, int count)
+        {
+            _nodes = nodes;
+            _count = count;
+            _index = -1;
+        }
+
+        public TrecsDictionaryKeys<TKey> GetEnumerator() => this;
+
+        public TKey Current
+        {
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            get => _nodes[_index].Key;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool MoveNext() => ++_index < _count;
+    }
+
+    /// <summary>Entries of a dictionary view in index order, valid until the dictionary changes.</summary>
+    public unsafe struct TrecsDictionaryEnumerator<TKey, TValue>
+        where TKey : unmanaged, IEquatable<TKey>
+        where TValue : unmanaged
+    {
+        [NativeDisableUnsafePtrRestriction]
+        readonly IterableDictionaryNode<TKey>* _nodes;
+
+        [NativeDisableUnsafePtrRestriction]
+        readonly TValue* _values;
+        readonly int _count;
+        int _index;
+
+        internal TrecsDictionaryEnumerator(
+            IterableDictionaryNode<TKey>* nodes,
+            TValue* values,
+            int count
+        )
+        {
+            _nodes = nodes;
+            _values = values;
+            _count = count;
+            _index = -1;
+        }
+
+        public TrecsDictionaryEntry<TKey, TValue> Current
+        {
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            get => new TrecsDictionaryEntry<TKey, TValue>(_nodes[_index].Key, _values + _index);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool MoveNext() => ++_index < _count;
+    }
+
+    public readonly unsafe struct TrecsDictionaryEntry<TKey, TValue>
+        where TValue : unmanaged
+    {
+        public readonly TKey Key;
+
+        [NativeDisableUnsafePtrRestriction]
+        readonly TValue* _value;
+
+        internal TrecsDictionaryEntry(TKey key, TValue* value)
+        {
+            Key = key;
+            _value = value;
+        }
+
+        public ref TValue Value
+        {
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            get => ref *_value;
+        }
+
+        public void Deconstruct(out TKey key, out TValue value)
+        {
+            key = Key;
+            value = *_value;
+        }
+    }
+
+    /// <summary>Read-only twin of <see cref="TrecsDictionaryEnumerator{TKey, TValue}"/>.</summary>
+    public struct TrecsDictionaryReadEnumerator<TKey, TValue>
+        where TKey : unmanaged, IEquatable<TKey>
+        where TValue : unmanaged
+    {
+        TrecsDictionaryEnumerator<TKey, TValue> _inner;
+
+        internal unsafe TrecsDictionaryReadEnumerator(
+            IterableDictionaryNode<TKey>* nodes,
+            TValue* values,
+            int count
+        )
+        {
+            _inner = new TrecsDictionaryEnumerator<TKey, TValue>(nodes, values, count);
+        }
+
+        public TrecsDictionaryReadEntry<TKey, TValue> Current
+        {
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            get => new TrecsDictionaryReadEntry<TKey, TValue>(_inner.Current);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool MoveNext() => _inner.MoveNext();
+    }
+
+    public readonly struct TrecsDictionaryReadEntry<TKey, TValue>
+        where TValue : unmanaged
+    {
+        readonly TrecsDictionaryEntry<TKey, TValue> _inner;
+
+        internal TrecsDictionaryReadEntry(TrecsDictionaryEntry<TKey, TValue> inner)
+        {
+            _inner = inner;
+        }
+
+        public TKey Key => _inner.Key;
+
+        public ref readonly TValue Value
+        {
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            get => ref _inner.Value;
+        }
+
+        public void Deconstruct(out TKey key, out TValue value) =>
+            _inner.Deconstruct(out key, out value);
     }
 }

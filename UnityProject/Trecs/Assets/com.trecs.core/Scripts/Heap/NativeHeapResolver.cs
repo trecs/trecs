@@ -2,8 +2,11 @@ using System;
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Threading;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
+using Unity.Jobs.LowLevel.Unsafe;
+using Unity.Mathematics;
 
 namespace Trecs.Internal
 {
@@ -37,6 +40,13 @@ namespace Trecs.Internal
         /// <summary>1 if this slot currently backs a live allocation; 0 otherwise.</summary>
         public byte InUse;
 
+        /// <summary>
+        /// 1 while <see cref="Address"/> points at a block a job grew outside the heap's pages
+        /// (<see cref="DetachedBlock"/>). The heap's own slot for the allocation stays reserved
+        /// until <c>NativeHeap.AdoptDetached</c> moves the block back into it.
+        /// </summary>
+        public byte IsDetached;
+
 #if ENABLE_UNITY_COLLECTIONS_CHECKS
         /// <summary>
         /// Per-allocation safety handle. Stable across the lifetime of this allocation:
@@ -48,24 +58,19 @@ namespace Trecs.Internal
     }
 
     /// <summary>
-    /// Dense-list twin of <see cref="NativeHeapEntry"/> carrying the full set of per-slot
-    /// metadata. Main-thread-only bookkeeping fields (<c>OwnsWholePage</c>, <c>PageId</c>,
-    /// <c>SlotIndex</c>) live here rather than in the side-table entry, keeping the entry
-    /// at 16 bytes for better cache utilisation during job resolution. Also serves as the
-    /// on-disk serialization shape — process-local fields (<c>Address</c>,
-    /// <c>AtomicSafetyHandle</c>) are excluded, so the byte stream is identical between
-    /// editor and release builds.
+    /// Where a live allocation sits in the pages: main-thread bookkeeping, kept out of
+    /// <see cref="NativeHeapEntry"/> so jobs resolve through 16-byte entries. Type hash and
+    /// generation live in the entry only. Serialized as is.
     /// </summary>
     [StructLayout(LayoutKind.Sequential)]
     internal struct NativeHeapEntryPayload
     {
-        public int TypeHash;
-        public byte Generation;
-        public byte InUse;
+        public int PageId;
+
+        // A bucket page holds at most MinPageSize / MinBucketSlotSize slots.
+        public ushort SlotIndex;
         public byte OwnsWholePage;
         public byte _padding;
-        public int PageId;
-        public int SlotIndex;
     }
 
     /// <summary>
@@ -101,8 +106,15 @@ namespace Trecs.Internal
         // Total chunk slots needed to address every possible side-table index.
         internal const int MaxChunkCount = (int)((MaxIndex + 1u) >> ChunkSizeBits); // 16,384
 
+        // Bytes of one side-table chunk: its entries, then one detached bit per entry.
+        internal static int ChunkByteSize =>
+            UnsafeUtility.SizeOf<NativeHeapEntry>() * ChunkSize + ChunkSize / 8;
+
         [NativeDisableContainerSafetyRestriction]
         readonly NativeArray<IntPtr> _chunkDirectory;
+
+        [NativeDisableUnsafePtrRestriction]
+        readonly unsafe NativeHeapDetachLog* _detachLog;
 
         // 1 if this resolver may be passed to a heap-mutating Write open
         // (TrecsList, NativeUniquePtr); 0 if Read-only. Stamped from the role
@@ -114,19 +126,56 @@ namespace Trecs.Internal
         // Internal: only NativeHeap constructs the raw resolver. Role-aware
         // copies for the user-facing surface go through the (in source, bool)
         // overload below.
-        internal NativeHeapResolver(NativeArray<IntPtr> chunkDirectory)
+        internal unsafe NativeHeapResolver(
+            NativeArray<IntPtr> chunkDirectory,
+            NativeHeapDetachLog* detachLog
+        )
         {
             _chunkDirectory = chunkDirectory;
+            _detachLog = detachLog;
             _canMutateHeap = 1;
         }
 
         // Role-aware copy: same backing directory, override the mutation bit.
         // Used by WorldAccessor and NativeWorldAccessor to produce a Variable-role
         // resolver that fails fast at Write-open time inside Burst jobs.
-        internal NativeHeapResolver(in NativeHeapResolver source, bool canMutateHeap)
+        internal unsafe NativeHeapResolver(in NativeHeapResolver source, bool canMutateHeap)
         {
             _chunkDirectory = source._chunkDirectory;
+            _detachLog = source._detachLog;
             _canMutateHeap = canMutateHeap ? (byte)1 : (byte)0;
+        }
+
+        internal unsafe NativeHeapDetachLog* DetachLog => _detachLog;
+
+        /// <summary>
+        /// Asserts the allocation <paramref name="handle"/> named is still live in
+        /// <paramref name="slot"/>: catches a view used after its container was disposed,
+        /// in shipping builds too (1-byte generation: 1/256 chance to miss once reused).
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static unsafe void AssertSlotLive(NativeHeapEntry* slot, PtrHandle handle)
+        {
+            TrecsAssert.That(
+                slot->InUse == 1 && slot->Generation == (byte)(handle.Value >> GenerationShift),
+                "Heap view is stale: allocation {0} was freed since the view was opened. "
+                    + "Re-open the view after any code path that disposes the container.",
+                handle.Value
+            );
+        }
+
+        /// <summary>
+        /// Slot size the heap hands out for an allocation of <paramref name="size"/> bytes:
+        /// a power-of-two bucket up to <see cref="NativeHeap.MaxBucketSlotSize"/>, the exact
+        /// size above it. Growable containers size their capacity to fill it.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static int GetSlotByteSize(int size, int alignment)
+        {
+            var needed = math.max(size, alignment);
+            return needed > NativeHeap.MaxBucketSlotSize
+                ? needed
+                : math.max(NativeHeap.MinBucketSlotSize, math.ceilpow2(needed));
         }
 
         /// <summary>
@@ -298,6 +347,204 @@ namespace Trecs.Internal
             var v = handle.Value;
             index = v & IndexMask;
             generation = (byte)(v >> GenerationShift);
+        }
+    }
+
+    /// <summary>
+    /// Which side-table chunks hold a detached entry: one bit per chunk. Each chunk's own
+    /// bits (after its entries) name the entries. Jobs set bits; the main thread clears them
+    /// when no job runs.
+    /// </summary>
+    internal unsafe struct NativeHeapDetachLog
+    {
+        internal const int ChunkWordCount = NativeHeapResolver.MaxChunkCount / 64;
+
+        internal int HasDetached;
+        internal int ArenaCount;
+
+        // One per job thread index; detached blocks live here until the next adoption.
+        internal DetachArena* Arenas;
+        internal fixed long ChunkBits[ChunkWordCount];
+    }
+
+    // A cache line per thread, so threads bumping their own arena share none.
+    [StructLayout(LayoutKind.Explicit, Size = 64)]
+    internal unsafe struct DetachArena
+    {
+        // Chunks chain through their first pointer.
+        [FieldOffset(0)]
+        public byte* Chunk;
+
+        [FieldOffset(8)]
+        public byte* LargeChunks;
+
+        [FieldOffset(16)]
+        public int Offset;
+
+        [FieldOffset(20)]
+        public int End;
+    }
+
+    /// <summary>
+    /// A heap allocation's block that a job grew, held outside the heap's pages until the
+    /// next phase boundary. Placement in pages must not depend on thread timing (snapshots
+    /// blit pages and lockstep peers must match), so jobs never touch pages: they bump a
+    /// block from their thread's arena, repoint the allocation's side-table entry at it, and
+    /// the main thread copies it into a page slot in side-table order, then frees the
+    /// arenas. The handle never changes.
+    /// </summary>
+    internal static unsafe class DetachedBlock
+    {
+        // Block size sits in front of the block.
+        const int PrefixBytes = 16;
+        const int ChunkHeaderBytes = 16;
+        const int ChunkBytes = 16 * 1024;
+
+        // Blocks above this get a chunk of their own, leaving the shared chunk's room.
+        const int LargeBlockBytes = ChunkBytes / 4;
+
+        internal const int MaxAlignment = PrefixBytes;
+
+        internal static int GetSize(void* block) => *(int*)((byte*)block - PrefixBytes);
+
+        internal static void InitArenas(NativeHeapDetachLog* log)
+        {
+            log->ArenaCount = JobsUtility.ThreadIndexCount;
+            var bytes = (long)sizeof(DetachArena) * log->ArenaCount;
+            log->Arenas = (DetachArena*)
+                UnsafeUtility.MallocTracked(bytes, 64, Allocator.Persistent, 0);
+            UnsafeUtility.MemClear(log->Arenas, bytes);
+        }
+
+        // Main thread, no job running.
+        internal static void FreeArenaChunks(NativeHeapDetachLog* log)
+        {
+            for (int i = 0; i < log->ArenaCount; i++)
+            {
+                ref var arena = ref log->Arenas[i];
+                FreeChain(arena.Chunk);
+                FreeChain(arena.LargeChunks);
+                arena = default;
+            }
+        }
+
+        internal static void DisposeArenas(NativeHeapDetachLog* log)
+        {
+            FreeArenaChunks(log);
+            UnsafeUtility.FreeTracked(log->Arenas, Allocator.Persistent);
+        }
+
+        static void FreeChain(byte* chunk)
+        {
+            while (chunk != null)
+            {
+                var next = *(byte**)chunk;
+                UnsafeUtility.Free(chunk, Allocator.Persistent);
+                chunk = next;
+            }
+        }
+
+        static byte* Allocate(NativeHeapDetachLog* log, int size)
+        {
+            var needed = PrefixBytes + ((size + 15) & ~15);
+            var threadIndex = JobsUtility.ThreadIndex;
+            TrecsDebugAssert.That(
+                threadIndex < log->ArenaCount,
+                "DetachedBlock: thread index {0} past arena count {1}",
+                threadIndex,
+                log->ArenaCount
+            );
+            ref var arena = ref log->Arenas[threadIndex];
+            byte* basePtr;
+            if (needed > LargeBlockBytes)
+            {
+                var chunk = NewChunk(ChunkHeaderBytes + needed, ref arena.LargeChunks);
+                basePtr = chunk + ChunkHeaderBytes;
+            }
+            else
+            {
+                if (arena.Chunk == null || arena.Offset + needed > arena.End)
+                {
+                    NewChunk(ChunkBytes, ref arena.Chunk);
+                    arena.Offset = ChunkHeaderBytes;
+                    arena.End = ChunkBytes;
+                }
+                basePtr = arena.Chunk + arena.Offset;
+                arena.Offset += needed;
+            }
+            *(int*)basePtr = size;
+            return basePtr + PrefixBytes;
+        }
+
+        static byte* NewChunk(long bytes, ref byte* chain)
+        {
+            var chunk = (byte*)UnsafeUtility.Malloc(bytes, MaxAlignment, Allocator.Persistent);
+            *(byte**)chunk = chain;
+            chain = chunk;
+            return chunk;
+        }
+
+        /// <summary>
+        /// Moves the allocation behind <paramref name="handle"/> to a new detached block of
+        /// <paramref name="newSize"/> bytes, copying its first <paramref name="copyBytes"/>
+        /// bytes and zeroing the rest. Any thread; the caller holds write access to the
+        /// allocation. Returns the new block.
+        /// </summary>
+        internal static void* Reallocate(
+            NativeHeapEntry* slot,
+            PtrHandle handle,
+            NativeHeapDetachLog* log,
+            int newSize,
+            int copyBytes
+        )
+        {
+            TrecsDebugAssert.That(
+                copyBytes >= 0 && copyBytes <= newSize,
+                "DetachedBlock.Reallocate: copyBytes {0} outside [0, {1}]",
+                copyBytes,
+                newSize
+            );
+            var block = Allocate(log, newSize);
+            UnsafeUtility.MemCpy(block, slot->Address.ToPointer(), copyBytes);
+            UnsafeUtility.MemClear(block + copyBytes, newSize - copyBytes);
+
+            // A block grown again stays in its arena until adoption frees the arenas.
+            if (slot->IsDetached == 0)
+            {
+                slot->IsDetached = 1;
+                Mark(slot, handle, log);
+            }
+            slot->Address = new IntPtr(block);
+            return block;
+        }
+
+        static void Mark(NativeHeapEntry* slot, PtrHandle handle, NativeHeapDetachLog* log)
+        {
+            NativeHeapResolver.DecodeHandle(handle, out var index, out _);
+            var inChunk = (int)(index & NativeHeapResolver.ChunkIndexMask);
+            var entryBits = (long*)(slot - inChunk + NativeHeapResolver.ChunkSize);
+            SetBit(entryBits + (inChunk >> 6), 1L << (inChunk & 63));
+            var chunk = (int)(index >> NativeHeapResolver.ChunkSizeBits);
+            SetBit(log->ChunkBits + (chunk >> 6), 1L << (chunk & 63));
+            // Read first: every thread writing the line would bounce it between cores.
+            if (log->HasDetached == 0)
+            {
+                log->HasDetached = 1;
+            }
+        }
+
+        static void SetBit(long* word, long bit)
+        {
+            var seen = *word;
+            while ((seen & bit) == 0)
+            {
+                var prior = Interlocked.CompareExchange(ref *word, seen | bit, seen);
+                if (prior == seen)
+                {
+                    return;
+                }
+                seen = prior;
+            }
         }
     }
 }
