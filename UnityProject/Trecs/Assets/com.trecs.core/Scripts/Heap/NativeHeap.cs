@@ -69,6 +69,9 @@ namespace Trecs.Internal
     /// </summary>
     internal sealed class NativeHeap : IDisposable
     {
+        static readonly TrecsProfilerMarker _allocMarker = new("NativeHeap.Alloc");
+        static readonly TrecsProfilerMarker _freeMarker = new("NativeHeap.Free");
+
         readonly TrecsLog _log;
 
         // Slot-size ladder: powers of two from 16 B up to 64 KB. Above this we use the
@@ -391,7 +394,7 @@ namespace Trecs.Internal
             [CallerLineNumber] int callerLine = 0
         )
         {
-            using var _ = TrecsProfiling.Start("NativeHeap.Alloc");
+            using var _ = _allocMarker.Auto();
             TrecsDebugAssert.That(!_isDisposed);
             TrecsDebugAssert.That(size > 0, "Allocation size must be positive");
             TrecsDebugAssert.That(
@@ -528,7 +531,7 @@ namespace Trecs.Internal
         /// </summary>
         public void Free(PtrHandle handle)
         {
-            using var _ = TrecsProfiling.Start("NativeHeap.Free");
+            using var _ = _freeMarker.Auto();
             TrecsDebugAssert.That(!_isDisposed);
             TrecsDebugAssert.That(!handle.IsNull, "Attempted to free null PtrHandle");
             TrecsDebugAssert.That(

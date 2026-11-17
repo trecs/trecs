@@ -184,6 +184,10 @@ namespace Trecs
     /// </summary>
     public sealed class BlobCache
     {
+        static readonly TrecsProfilerMarker _tryGetBlobAndMetadataMarker = new(
+            "BlobCache.TryGetBlobAndMetadata"
+        );
+
         readonly TrecsLog _log;
 
         readonly IterableDictionary<PtrHandle, BlobId> _handles = new();
@@ -925,7 +929,7 @@ namespace Trecs
         {
             AssertMainThreadAndNotDisposed();
 
-            using var _ = TrecsProfiling.Start("BlobCache.TryGetBlobAndMetadata");
+            using var _ = _tryGetBlobAndMetadataMarker.Auto();
 
             _log.Trace("Attempting to look up blob with id {0}", id);
 

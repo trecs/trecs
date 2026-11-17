@@ -742,7 +742,7 @@ namespace Trecs.Internal
 
             try
             {
-                using (TrecsProfiling.Start("{0}.Execute", systemInfo.DebugName))
+                using (systemInfo.ExecuteMarker.Auto())
                 {
                     ((ISystem)systemInfo.System).Execute();
                 }

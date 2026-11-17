@@ -37,7 +37,7 @@ namespace Trecs
                 "UniqueHashGenerator is main-thread only"
             );
 
-            using (TrecsProfiling.Start("Generating guid for type {0}", typeof(T)))
+            using (GenerateMarker<T>.Value.Auto())
             {
                 _serializeHelper.ClearMemoryStream();
 
@@ -69,6 +69,13 @@ namespace Trecs
                     hash = 1; // Reserve 0 for null
                 return hash;
             }
+        }
+
+        static class GenerateMarker<T>
+        {
+            public static readonly TrecsProfilerMarker Value = new(
+                "Generating guid for type " + typeof(T)
+            );
         }
     }
 }

@@ -44,6 +44,7 @@ namespace Trecs
             SystemDependencies = systemDependencies;
             Phase = phase;
             DebugName = debugName;
+            ExecuteMarker = new(debugName + ".Execute");
             Accessor = accessor;
             ExecutionPriority = executionPriority;
         }
@@ -59,6 +60,7 @@ namespace Trecs
         public ISystem System { get; }
         public ReadOnlyList<int> SystemDependencies { get; }
         public string DebugName { get; }
+        internal TrecsProfilerMarker ExecuteMarker { get; }
 
         /// <summary>
         /// Position of this system in the original registration order. Stable for the

@@ -6,6 +6,8 @@ namespace Trecs
 {
     internal class EcsStructuralOps
     {
+        static readonly TrecsProfilerMarker _addEntityMarker = new("EntitySubmitter.AddEntity");
+
         readonly TrecsLog _log;
 
         readonly EntitySubmitter _entitySubmitter;
@@ -67,7 +69,7 @@ namespace Trecs
 
             _log.Trace("Building new entity of type {0}", resolvedTemplate);
 
-            using (TrecsProfiling.Start("EntitySubmitter.AddEntity"))
+            using (_addEntityMarker.Auto())
             {
                 return _entitySubmitter.AddEntity(
                     group,

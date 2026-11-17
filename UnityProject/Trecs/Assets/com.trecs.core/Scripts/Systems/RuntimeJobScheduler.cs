@@ -618,17 +618,28 @@ namespace Trecs.Internal
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         static void CompleteWithSpan(JobEntry entry)
         {
-            if (entry.Name == null)
+#if ENABLE_PROFILER
+            if (entry.Name != null)
             {
-                entry.Handle.Complete();
+                if (!_waitMarkers.TryGetValue(entry.Name, out var marker))
+                {
+                    marker = new TrecsProfilerMarker("Wait: " + entry.Name);
+                    _waitMarkers.Add(entry.Name, marker);
+                }
+
+                using (marker.Auto())
+                {
+                    entry.Handle.Complete();
+                }
                 return;
             }
-
-            using (TrecsProfiling.Start("Wait: {0}", entry.Name))
-            {
-                entry.Handle.Complete();
-            }
+#endif
+            entry.Handle.Complete();
         }
+
+#if ENABLE_PROFILER
+        static readonly Dictionary<string, TrecsProfilerMarker> _waitMarkers = new();
+#endif
 
         // Complete an entry during CompleteAllOutstanding, deduping across the
         // writer/reader/untracked buckets via _completedThisCall. Already-completed
