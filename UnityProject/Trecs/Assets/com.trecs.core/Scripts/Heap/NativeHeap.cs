@@ -1737,9 +1737,7 @@ namespace Trecs.Internal
 
             _sparseToDense[sideTableIdx] = _densePayloads.Length;
             _denseSlotIndices.Add(sideTableIdx);
-            _densePayloads.Add(
-                new NativeHeapEntryPayload { PageId = pageId, OwnsWholePage = 1 }
-            );
+            _densePayloads.Add(new NativeHeapEntryPayload { PageId = pageId, OwnsWholePage = 1 });
 
 #if DEBUG
             if (callerFile != null)
@@ -2053,7 +2051,10 @@ namespace Trecs.Internal
                     return;
                 }
 
-                bucketIdx = math.max(0, math.ceillog2(neededSlotSize) - math.tzcnt(MinBucketSlotSize));
+                bucketIdx = math.max(
+                    0,
+                    math.ceillog2(neededSlotSize) - math.tzcnt(MinBucketSlotSize)
+                );
                 ref var bucket = ref Buckets[bucketIdx];
                 if (bucket.FreeSlots.Length == 0)
                 {

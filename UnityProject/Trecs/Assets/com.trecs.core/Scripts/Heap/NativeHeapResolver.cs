@@ -15,10 +15,10 @@ namespace Trecs.Internal
     /// the store has handed out; recycled when the handle is freed. The <see cref="Generation"/>
     /// field plus the handle's encoded generation detect stale-handle access after slot reuse.
     ///
-    /// <para>Only fields needed by Burst jobs live here (Address, TypeHash, Generation, InUse,
-    /// Safety). Main-thread-only bookkeeping (OwnsWholePage, PageId, SlotIndex) lives in the
-    /// dense <see cref="NativeHeapEntryPayload"/> list — keeping the entry at 16 bytes improves
-    /// cache utilisation during job resolution.</para>
+    /// <para>Only fields needed by Burst jobs live here. Page bookkeeping (OwnsWholePage, PageId,
+    /// SlotIndex) lives in the dense <see cref="NativeHeapEntryPayload"/> list, keeping the
+    /// entry at 16 bytes without safety checks. Each side-table chunk ends with one detach bit
+    /// per entry, outside the entries.</para>
     /// </summary>
     [StructLayout(LayoutKind.Sequential)]
     [EditorBrowsable(EditorBrowsableState.Never)]

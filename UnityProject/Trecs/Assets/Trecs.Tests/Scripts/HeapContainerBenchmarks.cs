@@ -55,7 +55,8 @@ namespace Trecs.Tests
                     pointers[i] = (IntPtr)list;
                 }
                 var resolver = heap.Resolver;
-                var label = $"{entityCount} lists x {length} ints, safety {(safetyChecks ? "on" : "off")}";
+                var label =
+                    $"{entityCount} lists x {length} ints, safety {(safetyChecks ? "on" : "off")}";
 
                 var fillTrecs = new RefillTrecs
                 {
@@ -72,14 +73,35 @@ namespace Trecs.Tests
                     label,
                     "refill AddNoResize",
                     Time(fillTrecsNoResize),
-                    Time(new RefillInline { Lists = inline, Length = length, NoResize = true }),
-                    Time(new RefillPointer { Lists = pointers, Length = length, NoResize = true })
+                    Time(
+                        new RefillInline
+                        {
+                            Lists = inline,
+                            Length = length,
+                            NoResize = true,
+                        }
+                    ),
+                    Time(
+                        new RefillPointer
+                        {
+                            Lists = pointers,
+                            Length = length,
+                            NoResize = true,
+                        }
+                    )
                 );
 
                 Report(
                     label,
                     "sum (read view)",
-                    Time(new SumTrecsRead { Lists = trecs, Resolver = resolver, Sums = sums }),
+                    Time(
+                        new SumTrecsRead
+                        {
+                            Lists = trecs,
+                            Resolver = resolver,
+                            Sums = sums,
+                        }
+                    ),
                     Time(new SumInline { Lists = inline, Sums = sums }),
                     Time(new SumPointer { Lists = pointers, Sums = sums })
                 );
@@ -108,7 +130,9 @@ namespace Trecs.Tests
                     growPointer[run] = TimeOnce(fillPointer);
                 }
                 Report(label, "grow from empty", growTrecs, growInline, growPointer);
-                Debug.LogWarning($"[bench] {label} | grow from empty | trecs adopt {Median(adoptTrecs):F3} ms");
+                Debug.LogWarning(
+                    $"[bench] {label} | grow from empty | trecs adopt {Median(adoptTrecs):F3} ms"
+                );
 
                 ReportMemory(label, heap, inline);
                 ReportSerialization(label, heap, trecs, inline);
@@ -213,7 +237,10 @@ namespace Trecs.Tests
             );
         }
 
-        static void WriteInline(BinarySerializationWriter writer, NativeArray<UnsafeList<int>> lists)
+        static void WriteInline(
+            BinarySerializationWriter writer,
+            NativeArray<UnsafeList<int>> lists
+        )
         {
             for (int i = 0; i < lists.Length; i++)
             {
@@ -250,8 +277,10 @@ namespace Trecs.Tests
         {
             var stats = heap.GetStatistics();
             var sideTable =
-                (long)((stats.SideTableLength + NativeHeapResolver.ChunkSize - 1) / NativeHeapResolver.ChunkSize)
-                * NativeHeapResolver.ChunkByteSize;
+                (long)(
+                    (stats.SideTableLength + NativeHeapResolver.ChunkSize - 1)
+                    / NativeHeapResolver.ChunkSize
+                ) * NativeHeapResolver.ChunkByteSize;
             var perAllocation = stats.LiveAllocations * (16L + 4 + 4); // dense payload, slot index, sparse map
             var directory = NativeHeapResolver.MaxChunkCount * (long)IntPtr.Size;
             long unsafeBytes = 0;
@@ -317,9 +346,16 @@ namespace Trecs.Tests
             return sorted[sorted.Length / 2];
         }
 
-        static void Report(string label, string measure, double[] trecs, double[] inline, double[] pointer)
+        static void Report(
+            string label,
+            string measure,
+            double[] trecs,
+            double[] inline,
+            double[] pointer
+        )
         {
-            var line = $"[bench] {label} | {measure} | trecs {Median(trecs):F3} ms | unsafe inline {Median(inline):F3} ms";
+            var line =
+                $"[bench] {label} | {measure} | trecs {Median(trecs):F3} ms | unsafe inline {Median(inline):F3} ms";
             if (pointer != null)
             {
                 line += $" | unsafe pointer {Median(pointer):F3} ms";
